@@ -4860,22 +4860,23 @@ impl RdpServer {
                 }
                 ServerEvent::Disconnect(error) => {
                     debug!(?error, "Got disconnect event");
-                    if !conn.client_supports_errinfo {
+                    if conn.client_supports_errinfo {
+                        let pdu = rdp::headers::ShareDataPdu::ServerSetErrorInfo(ServerSetErrorInfoPdu(error));
+                        // pduSource=0, not user_channel_id -- same MS-RDPBCGR
+                        // 2.2.5.1.1 requirement as the EvictedByOtherConnection
+                        // arm above; upstream's original call here (before this
+                        // merge) predated that parameter and used
+                        // user_channel_id, which this fixes to match.
+                        let data = encode_share_data_pdu(pdu, 0, io_channel_id, user_channel_id)?;
+                        writer
+                            .write_all(&data)
+                            .await
+                            .map_err(|e| ServerError::io("send server set error info", e))?;
+                    } else {
                         // Same MS-RDPBCGR 3.3.5.7.1 rule as the eviction arm.
                         debug!("client did not opt into Set Error Info PDUs; disconnecting without the reason");
-                        return Ok(RunState::Disconnect);
                     }
-                    let pdu = rdp::headers::ShareDataPdu::ServerSetErrorInfo(ServerSetErrorInfoPdu(error));
-                    // pduSource=0, not user_channel_id -- same MS-RDPBCGR
-                    // 2.2.5.1.1 requirement as the EvictedByOtherConnection
-                    // arm above; upstream's original call here (before this
-                    // merge) predated that parameter and used
-                    // user_channel_id, which this fixes to match.
-                    let data = encode_share_data_pdu(pdu, 0, io_channel_id, user_channel_id)?;
-                    writer
-                        .write_all(&data)
-                        .await
-                        .map_err(|e| ServerError::io("send server set error info", e))?;
+                    send_disconnect_ultimatum(writer).await;
                     return Ok(RunState::Disconnect);
                 }
                 ServerEvent::Redirect(redirection) => {
@@ -6790,6 +6791,27 @@ async fn send_error_info(
     }
 }
 
+/// Sends the MCS Disconnect Provider Ultimatum that ends a server-initiated
+/// disconnection (MS-RDPBCGR 1.3.1.4.2), best-effort.
+///
+/// It tells a client that took no Set Error Info PDU that the server ended the
+/// connection on purpose: FreeRDP maps a provider-initiated ultimatum to
+/// `ERRINFO_RPC_INITIATED_DISCONNECT` and then does not auto-reconnect, as it
+/// does after a socket that just closes.
+async fn send_disconnect_ultimatum(writer: &mut impl FramedWrite) {
+    let ultimatum = mcs::DisconnectProviderUltimatum::from_reason(mcs::DisconnectReason::ProviderInitiated);
+    match encode_vec(&X224(mcs::McsMessage::DisconnectProviderUltimatum(ultimatum))) {
+        Ok(bytes) => {
+            if let Err(error) = writer.write_all(&bytes).await {
+                debug!(%error, "Could not send the disconnect ultimatum; disconnecting anyway");
+            }
+        }
+        Err(error) => {
+            warn!(%error, "Could not encode the disconnect ultimatum; disconnecting anyway");
+        }
+    }
+}
+
 async fn deactivate_all(io_channel_id: u16, user_channel_id: u16, writer: &mut impl FramedWrite) -> ServerResult<()> {
     let pdu = ShareControlPdu::ServerDeactivateAll(ServerDeactivateAll);
     let pdu = rdp::headers::ShareControlHeader {
@@ -8013,6 +8035,21 @@ mod tests {
         )
         .expect("encode");
         assert_eq!(writer.0, expected);
+    }
+
+    /// A server-initiated disconnect ends with a provider-initiated Disconnect
+    /// Provider Ultimatum, which FreeRDP clients read as deliberate even
+    /// without a Set Error Info PDU.
+    // oracle: spec MS-RDPBCGR §1.3.1.4.2
+    #[tokio::test]
+    async fn the_disconnect_ultimatum_is_provider_initiated() {
+        let mut writer = cliprdr_error_tests::CapturingWriter::default();
+        send_disconnect_ultimatum(&mut writer).await;
+        let x224: X224<mcs::McsMessage<'_>> = decode(&writer.0).expect("decode X.224/MCS");
+        let mcs::McsMessage::DisconnectProviderUltimatum(ultimatum) = x224.0 else {
+            panic!("expected a Disconnect Provider Ultimatum, got {:?}", x224.0);
+        };
+        assert_eq!(ultimatum.reason, mcs::DisconnectReason::ProviderInitiated);
     }
 
     /// A channel backend that owns a resource, released on drop the way
