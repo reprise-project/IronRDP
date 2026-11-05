@@ -765,19 +765,28 @@ impl FrameTracker {
 
     /// Discard pending frames for a graphics reset without ending the DVC generation.
     /// Previously issued frames can still be named by delayed suspend ACKs.
+    ///
+    /// A suspension outlives the reset: the client sends SUSPEND_FRAME_ACKNOWLEDGEMENT
+    /// once and does not repeat it after RDPGFX_RESET_GRAPHICS_PDU, so ending it here
+    /// would count frames that are never acknowledged until backpressure stalls output.
     fn clear_pending_frames(&mut self) {
         self.unacknowledged.clear();
         self.client_queue_depth = 0;
+        self.last_backpressure_state = false;
+    }
+
+    /// Discard pending frames and any suspension ahead of a new capability exchange.
+    fn clear_acknowledgement_state(&mut self) {
+        self.clear_pending_frames();
         self.ack_suspended = false;
         self.suspension_outstanding.clear();
         self.suspension_first_frame_id = None;
-        self.last_backpressure_state = false;
         self.last_ack_suspended_state = false;
     }
 
     /// Clear per-channel tracking while preserving operator config and the connection ceiling.
     pub fn clear(&mut self) {
-        self.clear_pending_frames();
+        self.clear_acknowledgement_state();
         self.generation_first_frame_id = self.next_frame_id;
     }
 }
@@ -2604,7 +2613,7 @@ impl GraphicsPipelineServer {
                  state for re-initialization (no DeleteSurface PDU emitted, surface ID counter reset)"
             );
             self.surfaces.reset_for_reinit();
-            self.frames.clear_pending_frames();
+            self.frames.clear_acknowledgement_state();
             self.reset_graphics_sent = false;
         }
 
@@ -3013,6 +3022,41 @@ mod tests {
         assert!(!tracker.resume_from_untracked_ack(during_pause, 99));
         tracker.clear();
         assert!(!tracker.suspend_from_untracked_ack(suspended_frame));
+    }
+
+    #[test]
+    fn suspension_survives_resize() {
+        let mut server = GraphicsPipelineServer::new(Box::new(DefaultsHandler));
+        server.state = ServerState::Ready;
+        let max = server.frames.max_in_flight();
+        assert_ne!(max, 0);
+        let frame_id = server.frames.begin_frame(GraphicsPipelineServer::make_timestamp(0));
+        server
+            .frames
+            .acknowledge(frame_id, SUSPEND_FRAME_ACK_QUEUE_DEPTH)
+            .unwrap();
+
+        server.resize_with_monitors(800, 600, Vec::new());
+
+        assert!(server.frames.is_ack_suspended());
+        for _ in 0..=max {
+            assert!(!server.frames.should_backpressure());
+            server.frames.begin_frame(GraphicsPipelineServer::make_timestamp(0));
+        }
+        assert!(!server.frames.should_backpressure());
+    }
+
+    #[test]
+    fn capabilities_readvertise_ends_suspension() {
+        let mut tracker = FrameTracker::new();
+        let frame_id = tracker.begin_frame(GraphicsPipelineServer::make_timestamp(0));
+        tracker.acknowledge(frame_id, SUSPEND_FRAME_ACK_QUEUE_DEPTH).unwrap();
+        tracker.clear_acknowledgement_state();
+        assert!(!tracker.is_ack_suspended());
+        for _ in 0..tracker.max_in_flight() {
+            tracker.begin_frame(GraphicsPipelineServer::make_timestamp(0));
+        }
+        assert!(tracker.should_backpressure());
     }
 
     struct DefaultsHandler;
