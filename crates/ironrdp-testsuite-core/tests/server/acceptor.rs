@@ -2149,9 +2149,9 @@ fn stepping_a_failed_finalization_returns_an_error() {
     sequence.step(&vc_frame, None, &mut WriteBuf::new()).unwrap_err();
 }
 
-// oracle: spec MS-RDPBCGR §2.2.12.1 (the pduSource field of the Monitor Layout PDU MUST be set to zero)
-#[test]
-fn monitor_layout_pdu_source_is_zero() {
+/// Drives a fresh 1920x1080 acceptor up to the Monitor Layout PDU, for a client that supports it and sent `monitors`
+/// as its Client Monitor Data, or no such block when `None`. Returns the PDU's `pduSource` and the monitors it lists.
+fn monitor_layout_sent(monitors: Option<Vec<Monitor>>) -> (u16, Vec<Monitor>) {
     let mut acceptor = multitransport_acceptor(None);
     let mut client_blocks = client_gcc_with_message_channel_and_multitransport(None);
     client_blocks
@@ -2160,6 +2160,7 @@ fn monitor_layout_pdu_source_is_zero() {
         .early_capability_flags
         .get_or_insert_with(ClientEarlyCapabilityFlags::empty)
         .insert(ClientEarlyCapabilityFlags::SUPPORT_MONITOR_LAYOUT_PDU);
+    client_blocks.monitor = monitors.map(|monitors| ClientMonitorData { monitors });
     drive_to_secure_settings_exchange(&mut acceptor, client_blocks);
 
     acceptor.step(&[], None, &mut WriteBuf::new()).unwrap(); // LicensingExchange
@@ -2171,13 +2172,112 @@ fn monitor_layout_pdu_source_is_zero() {
     let indication = mcs::decode_send_data_indication(output.filled()).unwrap();
     let share_control = decode_share_control(indication).unwrap();
     let ShareControlPdu::Data(ShareDataHeader {
-        share_data_pdu: ShareDataPdu::MonitorLayout(_),
+        share_data_pdu: ShareDataPdu::MonitorLayout(layout),
         ..
     }) = share_control.pdu
     else {
         panic!("expected a Monitor Layout PDU");
     };
-    assert_eq!(share_control.pdu_source, 0);
+    (share_control.pdu_source, layout.monitors)
+}
+
+// oracle: spec MS-RDPBCGR §2.2.12.1 (the pduSource field of the Monitor Layout PDU MUST be set to zero)
+#[test]
+fn monitor_layout_pdu_source_is_zero() {
+    let (pdu_source, _) = monitor_layout_sent(None);
+    assert_eq!(pdu_source, 0);
+}
+
+/// The single primary monitor spanning the 1920x1080 desktop of [`monitor_layout_sent`].
+const DESKTOP_MONITOR: Monitor = Monitor {
+    left: 0,
+    top: 0,
+    right: 1919,
+    bottom: 1079,
+    flags: MonitorFlags::PRIMARY,
+};
+
+// oracle: reference neutrinolabs/xrdp@5e7deccfe10770d3bef867f819d7a66434faf074:libxrdp/xrdp_caps.c (xrdp_caps_send_monitorlayout lists the client's monitor definitions as received)
+#[test]
+fn monitor_layout_echoes_the_client_monitors() {
+    let monitors = vec![
+        Monitor {
+            left: 0,
+            top: 0,
+            right: 1279,
+            bottom: 1079,
+            flags: MonitorFlags::PRIMARY,
+        },
+        Monitor {
+            left: -640,
+            top: 0,
+            right: -1,
+            bottom: 719,
+            flags: MonitorFlags::empty(),
+        },
+    ];
+
+    assert_eq!(monitor_layout_sent(Some(monitors.clone())).1, monitors);
+}
+
+// oracle: spec MS-RDPBCGR §2.2.1.3.6.1 (the primary monitor's upper-left corner is (0, 0); right and bottom are inclusive)
+#[test]
+fn monitor_layout_without_client_monitors_is_the_desktop() {
+    assert_eq!(monitor_layout_sent(None).1, [DESKTOP_MONITOR]);
+}
+
+// oracle: spec MS-RDPBCGR §2.2.1.3.6.1 (monitor positions are relative to the primary monitor, so a layout without one describes no session; the desktop stands in)
+#[test]
+fn monitor_layout_ignores_client_monitors_without_a_primary() {
+    let monitors = vec![
+        Monitor {
+            left: 0,
+            top: 0,
+            right: 959,
+            bottom: 1079,
+            flags: MonitorFlags::empty(),
+        },
+        Monitor {
+            left: 960,
+            top: 0,
+            right: 1919,
+            bottom: 1079,
+            flags: MonitorFlags::empty(),
+        },
+    ];
+
+    assert_eq!(monitor_layout_sent(Some(monitors)).1, [DESKTOP_MONITOR]);
+}
+
+// oracle: spec MS-RDPBCGR §2.2.1.3.6.1 (right and bottom are the inclusive lower-right corner, so a monitor ending left of where it starts has no pixels; the desktop stands in)
+#[test]
+fn monitor_layout_ignores_client_monitors_with_an_empty_monitor() {
+    let monitors = vec![
+        DESKTOP_MONITOR,
+        Monitor {
+            left: 1920,
+            top: 0,
+            right: 1919,
+            bottom: 1079,
+            flags: MonitorFlags::empty(),
+        },
+    ];
+
+    assert_eq!(monitor_layout_sent(Some(monitors)).1, [DESKTOP_MONITOR]);
+}
+
+// oracle: spec MS-RDPBCGR §2.2.12.1 (the monitorDefArray describes the monitor layout of the session, whose desktop is 1920x1080 here; the desktop stands in)
+#[test]
+fn monitor_layout_ignores_client_monitors_that_do_not_span_the_desktop() {
+    let monitors = vec![Monitor {
+        left: 0,
+        top: 0,
+        right: 2559,
+        bottom: 1439,
+        flags: MonitorFlags::PRIMARY,
+    }];
+
+    assert_eq!(monitor_layout_sent(Some(monitors)).1, [DESKTOP_MONITOR]);
 }
 
 async fn accept_spnego_credssp(

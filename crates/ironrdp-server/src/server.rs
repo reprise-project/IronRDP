@@ -234,8 +234,7 @@ pub struct ConnectionInfo {
     pub auto_reconnect: bool,
     /// See [`ironrdp_acceptor::AcceptorResult::client_monitors`]. Taken from the
     /// GCC Client Monitor Data (MS-RDPBCGR 2.2.1.3.6), not Client Core Data, and
-    /// empty when the client sent none. It doesn't change the Monitor Layout PDU
-    /// the acceptor sends, which still describes one monitor.
+    /// empty when the client sent none.
     pub client_monitors: Vec<ironrdp_pdu::gcc::Monitor>,
     /// See [`ironrdp_acceptor::AcceptorResult::routing_token`].
     pub routing_token: Option<String>,
