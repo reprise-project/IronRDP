@@ -336,6 +336,7 @@ pub trait ConnectionHandler: Send {
     /// By default, it is the display handler's initial size.
     /// With [`RdpServerBuilder::with_honor_client_desktop_size`] enabled, a valid client request from
     /// Client Core Data is adopted after clamping to the configured maximum.
+    /// [`Self::choose_desktop_size`] may then pick another size.
     /// Return an error to stop connection setup.
     /// A callback error closes the transport without sending an access-denied PDU.
     ///
@@ -358,6 +359,24 @@ pub trait ConnectionHandler: Send {
         _desktop_size: DesktopSize,
     ) -> ServerResult<()> {
         Ok(())
+    }
+
+    /// Picks the desktop size the acceptor offers in capability exchange, from the client's monitors.
+    ///
+    /// Called once per connection, after [`Self::on_client_session_config`] and before capability exchange.
+    /// `client_monitors` holds the client's [Client Monitor Data (TS_UD_CS_MONITOR), section 2.2.1.3.6], empty when
+    /// it sent none, and `desktop_size` is the size the acceptor would offer; returning it keeps that size.
+    /// The Monitor Layout PDU lists `client_monitors` only when their bounding box spans the returned size.
+    /// The display handler's [`RdpServerDisplay::request_initial_size`] then receives the size the client confirms.
+    ///
+    /// [Client Monitor Data (TS_UD_CS_MONITOR), section 2.2.1.3.6]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/a8029f8e-01e1-4f19-af67-bcad5bdef624
+    fn choose_desktop_size(
+        &mut self,
+        client_monitors: &[ironrdp_pdu::gcc::Monitor],
+        desktop_size: DesktopSize,
+    ) -> DesktopSize {
+        let _ = client_monitors;
+        desktop_size
     }
 
     /// Called once per connection, after credential and auto-reconnect
@@ -7015,6 +7034,17 @@ impl ConnectionSetupHandler for RdpServer {
 
     async fn handle_credentials(&mut self, credentials: Option<ReceivedCredentials>) -> Result<(), ConnectorError> {
         self.prepare_authenticated_connection(credentials).await
+    }
+
+    async fn choose_desktop_size(
+        &mut self,
+        client_monitors: &[ironrdp_pdu::gcc::Monitor],
+        desktop_size: DesktopSize,
+    ) -> DesktopSize {
+        with_connection_handler(self.connection_handler.as_ref(), |handler| {
+            handler.choose_desktop_size(client_monitors, desktop_size)
+        })
+        .unwrap_or(desktop_size)
     }
 
     async fn prepare_capability_exchange(&mut self, desktop_size: DesktopSize) -> Result<(), ConnectorError> {
