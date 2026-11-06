@@ -38,6 +38,29 @@ struct CredentialIdentity<'a> {
     domain: Option<&'a str>,
 }
 
+/// Whether `monitors` can stand as the session's layout in the Monitor Layout PDU: 1 to 16 monitors
+/// (MS-RDPBCGR 2.2.1.3.6), each at least one pixel wide and high, exactly one of them primary (2.2.1.3.6.1), and
+/// together spanning exactly `desktop`.
+fn is_session_layout(monitors: &[gcc::Monitor], desktop: DesktopSize) -> bool {
+    if !(1..=gcc::MONITOR_COUNT_MAX).contains(&monitors.len())
+        || monitors.iter().any(|m| m.right < m.left || m.bottom < m.top)
+        || monitors
+            .iter()
+            .filter(|m| m.flags.contains(gcc::MonitorFlags::PRIMARY))
+            .count()
+            != 1
+    {
+        return false;
+    }
+
+    let span = |start: fn(&gcc::Monitor) -> i32, end: fn(&gcc::Monitor) -> i32| {
+        let first = monitors.iter().map(start).min().unwrap_or_default();
+        let last = monitors.iter().map(end).max().unwrap_or_default();
+        i64::from(last) - i64::from(first) + 1
+    };
+    span(|m| m.left, |m| m.right) == i64::from(desktop.width) && span(|m| m.top, |m| m.bottom) == i64::from(desktop.height)
+}
+
 fn split_down_level_logon_name(s: &str) -> Option<(&str, &str)> {
     let (domain, username) = s.split_once('\\')?;
     if domain.is_empty() || username.is_empty() {
@@ -400,11 +423,11 @@ pub struct AcceptorResult {
     /// single monitor commonly does not. Servers that can present a variable
     /// number of outputs use it to present as many as the client has.
     ///
-    /// This is the client's layout, in the client's coordinates. It does not
-    /// change what the acceptor announces back: the Monitor Layout PDU
-    /// (section 2.2.12.1, sent when the client supports it) describes the
-    /// server's session and still lists one monitor spanning the desktop size,
-    /// whatever the server presents.
+    /// This is the client's layout, in the client's coordinates. When it holds
+    /// 1 to 16 monitors of non-zero size, exactly one primary, that together
+    /// span the desktop size, the Monitor Layout PDU (section 2.2.12.1, sent
+    /// when the client supports it) lists these monitors unchanged; otherwise
+    /// it lists one primary monitor spanning the desktop size.
     pub client_monitors: Vec<gcc::Monitor>,
     /// Multitransport (MS-RDPEMT) capability flags announced by the client in
     /// its GCC `MultiTransportChannelData` block (section 2.2.1.3.8).
@@ -1691,16 +1714,19 @@ impl Sequence for Acceptor {
             }
 
             AcceptorState::MonitorLayoutSend { channels } => {
+                let monitors = if is_session_layout(&self.client_monitors, self.desktop_size) {
+                    self.client_monitors.clone()
+                } else {
+                    vec![gcc::Monitor {
+                        left: 0,
+                        top: 0,
+                        right: i32::from(self.desktop_size.width) - 1,
+                        bottom: i32::from(self.desktop_size.height) - 1,
+                        flags: gcc::MonitorFlags::PRIMARY,
+                    }]
+                };
                 let monitor_layout =
-                    rdp::headers::ShareDataPdu::MonitorLayout(rdp::finalization_messages::MonitorLayoutPdu {
-                        monitors: vec![gcc::Monitor {
-                            left: 0,
-                            top: 0,
-                            right: i32::from(self.desktop_size.width) - 1,
-                            bottom: i32::from(self.desktop_size.height) - 1,
-                            flags: gcc::MonitorFlags::PRIMARY,
-                        }],
-                    });
+                    rdp::headers::ShareDataPdu::MonitorLayout(rdp::finalization_messages::MonitorLayoutPdu { monitors });
 
                 debug!(message = ?monitor_layout, "Send");
 
