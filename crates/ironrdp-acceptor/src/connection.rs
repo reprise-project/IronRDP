@@ -39,16 +39,17 @@ struct CredentialIdentity<'a> {
 }
 
 /// Whether `monitors` can stand as the session's layout in the Monitor Layout PDU: 1 to 16 monitors
-/// (MS-RDPBCGR 2.2.1.3.6), each at least one pixel wide and high, exactly one of them primary (2.2.1.3.6.1), and
-/// together spanning exactly `desktop`.
+/// (MS-RDPBCGR 2.2.1.3.6), each at least one pixel wide and high, exactly one of them primary and that one at (0, 0)
+/// (2.2.1.3.6.1), and together spanning exactly `desktop`.
 fn is_session_layout(monitors: &[gcc::Monitor], desktop: DesktopSize) -> bool {
+    let mut primaries = monitors.iter().filter(|m| m.flags.contains(gcc::MonitorFlags::PRIMARY));
+    let one_primary_at_origin = matches!(
+        (primaries.next(), primaries.next()),
+        (Some(primary), None) if primary.left == 0 && primary.top == 0
+    );
     if !(1..=gcc::MONITOR_COUNT_MAX).contains(&monitors.len())
         || monitors.iter().any(|m| m.right < m.left || m.bottom < m.top)
-        || monitors
-            .iter()
-            .filter(|m| m.flags.contains(gcc::MonitorFlags::PRIMARY))
-            .count()
-            != 1
+        || !one_primary_at_origin
     {
         return false;
     }
@@ -58,7 +59,8 @@ fn is_session_layout(monitors: &[gcc::Monitor], desktop: DesktopSize) -> bool {
         let last = monitors.iter().map(end).max().unwrap_or_default();
         i64::from(last) - i64::from(first) + 1
     };
-    span(|m| m.left, |m| m.right) == i64::from(desktop.width) && span(|m| m.top, |m| m.bottom) == i64::from(desktop.height)
+    span(|m| m.left, |m| m.right) == i64::from(desktop.width)
+        && span(|m| m.top, |m| m.bottom) == i64::from(desktop.height)
 }
 
 fn split_down_level_logon_name(s: &str) -> Option<(&str, &str)> {
@@ -1726,7 +1728,9 @@ impl Sequence for Acceptor {
                     }]
                 };
                 let monitor_layout =
-                    rdp::headers::ShareDataPdu::MonitorLayout(rdp::finalization_messages::MonitorLayoutPdu { monitors });
+                    rdp::headers::ShareDataPdu::MonitorLayout(rdp::finalization_messages::MonitorLayoutPdu {
+                        monitors,
+                    });
 
                 debug!(message = ?monitor_layout, "Send");
 
@@ -2026,5 +2030,36 @@ mod tests {
 
         assert!(acceptor.is_auto_reconnect_attempt());
         assert!(!acceptor.credentials_need_handling());
+    }
+
+    // The Client Monitor Data decoder already refuses more than 16 monitors, so only this unit test reaches the count
+    // check.
+    // oracle: spec MS-RDPBCGR §2.2.1.3.6 (monitorCount: the maximum allowed is 16)
+    #[test]
+    fn seventeen_monitors_are_not_a_session_layout() {
+        let monitors: Vec<_> = (0..17)
+            .map(|i| gcc::Monitor {
+                left: i * 100,
+                top: 0,
+                right: i * 100 + 99,
+                bottom: 99,
+                flags: if i == 0 {
+                    gcc::MonitorFlags::PRIMARY
+                } else {
+                    gcc::MonitorFlags::empty()
+                },
+            })
+            .collect();
+        let desktop = DesktopSize {
+            width: 1700,
+            height: 100,
+        };
+
+        assert!(!is_session_layout(&monitors, desktop));
+        // oracle: mutant the 17 monitors above rejected for a reason other than their count
+        assert!(is_session_layout(
+            &monitors[..16],
+            DesktopSize { width: 1600, ..desktop }
+        ));
     }
 }
