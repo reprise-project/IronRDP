@@ -2226,33 +2226,54 @@ fn monitor_layout_without_client_monitors_is_the_desktop() {
     assert_eq!(monitor_layout_sent(None).1, [DESKTOP_MONITOR]);
 }
 
-// oracle: spec MS-RDPBCGR §2.2.1.3.6.1 (monitor positions are relative to the primary monitor, so a layout without one describes no session; the desktop stands in)
-#[test]
-fn monitor_layout_ignores_client_monitors_without_a_primary() {
-    let monitors = vec![
-        Monitor {
-            left: 0,
-            top: 0,
-            right: 959,
-            bottom: 1079,
-            flags: MonitorFlags::empty(),
-        },
-        Monitor {
-            left: 960,
-            top: 0,
-            right: 1919,
-            bottom: 1079,
-            flags: MonitorFlags::empty(),
-        },
-    ];
-
-    assert_eq!(monitor_layout_sent(Some(monitors)).1, [DESKTOP_MONITOR]);
+/// Sends `monitors`, which do not describe the 1920x1080 session, and checks that the Monitor Layout PDU does not list
+/// them.
+fn assert_layout_not_echoed(monitors: Vec<Monitor>) {
+    let sent = monitor_layout_sent(Some(monitors.clone())).1;
+    assert_ne!(sent, monitors);
+    // oracle: mutant a fallback other than the single primary monitor spanning the desktop, such as an empty list
+    assert_eq!(sent, [DESKTOP_MONITOR]);
 }
 
-// oracle: spec MS-RDPBCGR §2.2.1.3.6.1 (right and bottom are the inclusive lower-right corner, so a monitor ending left of where it starts has no pixels; the desktop stands in)
+/// A 960x1080 monitor starting at `left`: a half of the 1920x1080 desktop when `left` is 0 or 960.
+const fn half(left: i32, flags: MonitorFlags) -> Monitor {
+    Monitor {
+        left,
+        top: 0,
+        right: left + 959,
+        bottom: 1079,
+        flags,
+    }
+}
+
+// oracle: spec MS-RDPBCGR §2.2.1.3.6.1 (monitor positions are relative to the primary monitor, so a layout without one describes no session)
 #[test]
-fn monitor_layout_ignores_client_monitors_with_an_empty_monitor() {
-    let monitors = vec![
+fn monitor_layout_ignores_client_monitors_without_a_primary() {
+    assert_layout_not_echoed(vec![half(0, MonitorFlags::empty()), half(960, MonitorFlags::empty())]);
+}
+
+// oracle: spec MS-RDPBCGR §2.2.1.3.6.1 (monitor positions are relative to the one monitor designated the primary)
+#[test]
+fn monitor_layout_ignores_client_monitors_with_two_primaries() {
+    assert_layout_not_echoed(vec![half(0, MonitorFlags::PRIMARY), half(960, MonitorFlags::PRIMARY)]);
+}
+
+// oracle: spec MS-RDPBCGR §2.2.1.3.6.1 (the upper-left corner of the primary monitor is always (0, 0))
+#[test]
+fn monitor_layout_ignores_client_monitors_whose_primary_is_not_at_the_origin() {
+    assert_layout_not_echoed(vec![half(0, MonitorFlags::empty()), half(960, MonitorFlags::PRIMARY)]);
+}
+
+// oracle: spec MS-RDPBCGR §2.2.1.3.6.1 (the upper-left corner of the primary monitor is always (0, 0), so a layout lists a primary)
+#[test]
+fn monitor_layout_ignores_client_monitor_data_without_monitors() {
+    assert_layout_not_echoed(Vec::new());
+}
+
+// oracle: spec MS-RDPBCGR §2.2.1.3.6.1 (right is the inclusive lower-right corner, so a monitor ending left of where it starts has no pixels)
+#[test]
+fn monitor_layout_ignores_client_monitors_with_a_monitor_inverted_horizontally() {
+    assert_layout_not_echoed(vec![
         DESKTOP_MONITOR,
         Monitor {
             left: 1920,
@@ -2261,23 +2282,49 @@ fn monitor_layout_ignores_client_monitors_with_an_empty_monitor() {
             bottom: 1079,
             flags: MonitorFlags::empty(),
         },
-    ];
-
-    assert_eq!(monitor_layout_sent(Some(monitors)).1, [DESKTOP_MONITOR]);
+    ]);
 }
 
-// oracle: spec MS-RDPBCGR §2.2.12.1 (the monitorDefArray describes the monitor layout of the session, whose desktop is 1920x1080 here; the desktop stands in)
+// oracle: spec MS-RDPBCGR §2.2.1.3.6.1 (bottom is the inclusive lower-right corner, so a monitor ending above where it starts has no pixels)
+#[test]
+fn monitor_layout_ignores_client_monitors_with_a_monitor_inverted_vertically() {
+    assert_layout_not_echoed(vec![
+        DESKTOP_MONITOR,
+        Monitor {
+            left: 0,
+            top: 1080,
+            right: 1919,
+            bottom: 1079,
+            flags: MonitorFlags::empty(),
+        },
+    ]);
+}
+
+// oracle: spec MS-RDPBCGR §2.2.12.1 (the monitorDefArray describes the monitor layout of the session, whose desktop is 1920x1080 here)
 #[test]
 fn monitor_layout_ignores_client_monitors_that_do_not_span_the_desktop() {
-    let monitors = vec![Monitor {
+    assert_layout_not_echoed(vec![Monitor {
         left: 0,
         top: 0,
         right: 2559,
         bottom: 1439,
         flags: MonitorFlags::PRIMARY,
-    }];
+    }]);
+}
 
-    assert_eq!(monitor_layout_sent(Some(monitors)).1, [DESKTOP_MONITOR]);
+// oracle: spec MS-RDPBCGR §2.2.12.1 (the monitorDefArray describes the monitor layout of the session, whose desktop is 1920x1080 here, while these monitors span 2560 pixels from x = -640)
+#[test]
+fn monitor_layout_ignores_client_monitors_left_of_the_primary_that_do_not_span_the_desktop() {
+    assert_layout_not_echoed(vec![
+        DESKTOP_MONITOR,
+        Monitor {
+            left: -640,
+            top: 0,
+            right: -1,
+            bottom: 719,
+            flags: MonitorFlags::empty(),
+        },
+    ]);
 }
 
 async fn accept_spnego_credssp(
