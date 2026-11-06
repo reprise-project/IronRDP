@@ -5683,7 +5683,7 @@ impl RdpServer {
             Ok(display_updates) => display_updates,
             Err(error) => {
                 if let ServerErrorKind::ErrorInfo(error_info) = *error.kind() {
-                    send_error_info(
+                    send_reason_and_ultimatum(
                         conn,
                         writer,
                         io_channel_id,
@@ -6789,6 +6789,21 @@ async fn send_error_info(
             warn!(%error, reason, "Could not encode the reason; disconnecting anyway");
         }
     }
+}
+
+/// Tells the client why the server ends the connection: the Set Error Info PDU
+/// when it opted in, then the Disconnect Provider Ultimatum, so a client that
+/// took no reason still does not auto-reconnect.
+async fn send_reason_and_ultimatum(
+    conn: &ConnectionState,
+    writer: &mut impl FramedWrite,
+    io_channel_id: u16,
+    user_channel_id: u16,
+    error_info: ErrorInfo,
+    reason: &str,
+) {
+    send_error_info(conn, writer, io_channel_id, user_channel_id, error_info, reason).await;
+    send_disconnect_ultimatum(writer).await;
 }
 
 /// Sends the MCS Disconnect Provider Ultimatum that ends a server-initiated
@@ -8035,6 +8050,31 @@ mod tests {
         )
         .expect("encode");
         assert_eq!(writer.0, expected);
+    }
+
+    /// A display that cannot start ends the connection with the ultimatum
+    /// whether or not the client took the Set Error Info PDU before it.
+    // oracle: spec MS-RDPBCGR §1.3.1.4.2
+    #[tokio::test]
+    async fn a_display_error_ends_with_the_ultimatum_after_the_reason() {
+        let error_info = ErrorInfo::ProtocolIndependentCode(ProtocolIndependentCode::CloseStackOnDriverFailure);
+        let mut ultimatum = cliprdr_error_tests::CapturingWriter::default();
+        send_disconnect_ultimatum(&mut ultimatum).await;
+        let mut conn = ConnectionState::default();
+
+        let mut writer = cliprdr_error_tests::CapturingWriter::default();
+        send_reason_and_ultimatum(&conn, &mut writer, 1003, 1007, error_info, "test").await;
+        assert_eq!(
+            writer.0, ultimatum.0,
+            "a client without Set Error Info gets the ultimatum alone"
+        );
+
+        conn.client_supports_errinfo = true;
+        let mut reason = cliprdr_error_tests::CapturingWriter::default();
+        send_error_info(&conn, &mut reason, 1003, 1007, error_info, "test").await;
+        let mut writer = cliprdr_error_tests::CapturingWriter::default();
+        send_reason_and_ultimatum(&conn, &mut writer, 1003, 1007, error_info, "test").await;
+        assert_eq!(writer.0, [reason.0, ultimatum.0].concat());
     }
 
     /// A server-initiated disconnect ends with a provider-initiated Disconnect
