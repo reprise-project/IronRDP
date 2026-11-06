@@ -166,6 +166,7 @@ pub struct Acceptor {
     multitransport_flags: Option<gcc::MultiTransportFlags>,
     early_capability_flags: gcc::ClientEarlyCapabilityFlags,
     client_monitors: Vec<gcc::Monitor>,
+    client_monitors_ex: Vec<gcc::ExtendedMonitorInfo>,
     routing_token: Option<String>,
     client_cluster_data: Option<gcc::ClientClusterData>,
     password_cookie: Option<PasswordCookie>,
@@ -433,6 +434,13 @@ pub struct AcceptorResult {
     /// when the client supports it) lists these monitors unchanged; otherwise
     /// it lists one primary monitor spanning the desktop size.
     pub client_monitors: Vec<gcc::Monitor>,
+    /// The extended attributes of the client's monitors from its GCC Client
+    /// Monitor Extended Data (section 2.2.1.3.9): physical size, orientation
+    /// and scale factors, in the order it sent them, which matches
+    /// `client_monitors`.
+    ///
+    /// Empty when the client did not send the block.
+    pub client_monitors_ex: Vec<gcc::ExtendedMonitorInfo>,
     /// Multitransport (MS-RDPEMT) capability flags announced by the client in
     /// its GCC `MultiTransportChannelData` block (section 2.2.1.3.8).
     ///
@@ -511,6 +519,7 @@ impl Acceptor {
             multitransport_flags: None,
             early_capability_flags: gcc::ClientEarlyCapabilityFlags::empty(),
             client_monitors: Vec::new(),
+            client_monitors_ex: Vec::new(),
             routing_token: None,
             client_cluster_data: None,
             password_cookie: None,
@@ -771,6 +780,7 @@ impl Acceptor {
             multitransport_flags: consumed.multitransport_flags,
             early_capability_flags: consumed.early_capability_flags,
             client_monitors: consumed.client_monitors,
+            client_monitors_ex: consumed.client_monitors_ex,
             routing_token: consumed.routing_token,
             client_cluster_data: consumed.client_cluster_data,
             password_cookie: consumed.password_cookie,
@@ -1035,6 +1045,7 @@ impl Acceptor {
                 multitransport_response_success: self.received_multitransport_response,
                 client_early_capability_flags: self.early_capability_flags,
                 client_monitors: self.client_monitors.clone(),
+                client_monitors_ex: self.client_monitors_ex.clone(),
                 reactivation: self.reactivation,
                 credentials: self.credentials_for_result(),
                 auto_reconnect: self.received_auto_reconnect.take(),
@@ -1348,6 +1359,9 @@ impl Sequence for Acceptor {
                 self.early_capability_flags = early_capability.unwrap_or(gcc::ClientEarlyCapabilityFlags::empty());
                 let client_wants_message_channel = gcc_blocks.message_channel.is_some();
                 self.client_monitors = gcc_blocks.monitor.map_or_else(Vec::new, |data| data.monitors);
+                self.client_monitors_ex = gcc_blocks
+                    .monitor_extended
+                    .map_or_else(Vec::new, |data| data.extended_monitors_info);
                 self.client_cluster_data.clone_from(&gcc_blocks.cluster);
                 self.keyboard_layout = gcc_blocks.core.keyboard_layout;
                 self.keyboard_type = gcc_blocks.core.keyboard_type;
