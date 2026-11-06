@@ -2255,7 +2255,7 @@ fn monitor_layout_ignores_client_monitors_without_a_primary() {
 // oracle: spec MS-RDPBCGR §2.2.1.3.6.1 (monitor positions are relative to the one monitor designated the primary)
 #[test]
 fn monitor_layout_ignores_client_monitors_with_two_primaries() {
-    assert_layout_not_echoed(vec![half(0, MonitorFlags::PRIMARY), half(960, MonitorFlags::PRIMARY)]);
+    assert_layout_not_echoed(vec![DESKTOP_MONITOR, DESKTOP_MONITOR]);
 }
 
 // oracle: spec MS-RDPBCGR §2.2.1.3.6.1 (the upper-left corner of the primary monitor is always (0, 0))
