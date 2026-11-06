@@ -860,6 +860,18 @@ impl Acceptor {
         self.desktop_size
     }
 
+    /// Offers `size` in the Demand Active PDU and the Monitor Layout PDU that follows it.
+    ///
+    /// Takes effect only before the acceptor leaves [`AcceptorState::CapabilitiesSendServer`].
+    pub(crate) fn offer_desktop_size(&mut self, size: DesktopSize) {
+        self.desktop_size = size;
+        set_bitmap_desktop_size(&mut self.server_capabilities, size);
+    }
+
+    pub(crate) fn client_monitors(&self) -> &[gcc::Monitor] {
+        &self.client_monitors
+    }
+
     pub(crate) fn is_reactivation(&self) -> bool {
         self.reactivation
     }

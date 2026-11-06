@@ -1545,8 +1545,17 @@ fn negotiated_acceptor_expecting(protocol: SecurityProtocol, creds: Option<Crede
 }
 
 fn post_credssp_messages(error_info: Option<ClientEarlyCapabilityFlags>) -> VecDeque<Vec<u8>> {
+    post_credssp_messages_with_monitors(error_info, None)
+}
+
+/// [`post_credssp_messages`], with `monitors` as the client's Client Monitor Data, or no such block when `None`.
+fn post_credssp_messages_with_monitors(
+    error_info: Option<ClientEarlyCapabilityFlags>,
+    monitors: Option<Vec<Monitor>>,
+) -> VecDeque<Vec<u8>> {
     let mut gcc = CLIENT_GCC_WITHOUT_OPTIONAL_FIELDS.clone();
     gcc.network = None;
+    gcc.monitor = monitors.map(|monitors| ClientMonitorData { monitors });
     gcc.core.optional_data = ClientCoreOptionalData {
         post_beta2_color_depth: gcc.core.optional_data.post_beta2_color_depth,
         client_product_id: gcc.core.optional_data.client_product_id,
@@ -2325,6 +2334,88 @@ fn monitor_layout_ignores_client_monitors_left_of_the_primary_that_do_not_span_t
             flags: MonitorFlags::empty(),
         },
     ]);
+}
+
+/// Offers the size it was built with and records what the acceptor showed it.
+struct DesktopChooser {
+    chosen: DesktopSize,
+    client_monitors: Option<Vec<Monitor>>,
+    prepared_size: Option<DesktopSize>,
+}
+
+#[async_trait::async_trait(?Send)]
+impl ConnectionSetupHandler for DesktopChooser {
+    async fn handle_credentials(&mut self, _: Option<ReceivedCredentials>) -> ConnectorResult<()> {
+        Ok(())
+    }
+
+    async fn choose_desktop_size(&mut self, client_monitors: &[Monitor], _: DesktopSize) -> DesktopSize {
+        self.client_monitors = Some(client_monitors.to_vec());
+        self.chosen
+    }
+
+    async fn prepare_capability_exchange(&mut self, desktop_size: DesktopSize) -> ConnectorResult<()> {
+        self.prepared_size = Some(desktop_size);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_desktop_size_chosen_for_the_client_monitors_is_offered_with_them() {
+    let monitors = vec![
+        Monitor {
+            left: 0,
+            top: 0,
+            right: 1279,
+            bottom: 719,
+            flags: MonitorFlags::PRIMARY,
+        },
+        Monitor {
+            left: 1280,
+            top: 0,
+            right: 2559,
+            bottom: 719,
+            flags: MonitorFlags::empty(),
+        },
+    ];
+    let their_box = DesktopSize {
+        width: 2560,
+        height: 720,
+    };
+    let mut acceptor = negotiated_acceptor(SecurityProtocol::SSL);
+    let mut handler = DesktopChooser {
+        chosen: their_box,
+        client_monitors: None,
+        prepared_size: None,
+    };
+    let framed = Framed::<HandshakeStream>::new(HandshakeStream {
+        incoming: post_credssp_messages_with_monitors(
+            Some(ClientEarlyCapabilityFlags::SUPPORT_MONITOR_LAYOUT_PDU),
+            Some(monitors.clone()),
+        ),
+        ..HandshakeStream::default()
+    });
+    let outgoing = Rc::clone(&framed.get_inner().0.outgoing);
+
+    // The client sends no Confirm Active, so the handshake stops after the Monitor Layout PDU.
+    let _ = accept_finalize_with(framed, &mut acceptor, &mut handler).await;
+
+    // oracle: spec MS-RDPBCGR §2.2.1.3.6 (the Client Monitor Data the client sent)
+    assert_eq!(handler.client_monitors.as_ref(), Some(&monitors));
+    // oracle: mutant the chosen size not reaching the capability setup that binds the display at it
+    assert_eq!(handler.prepared_size, Some(their_box));
+    let layout = outgoing.borrow().iter().find_map(|bytes| {
+        let indication = mcs::decode_send_data_indication(bytes).ok()?;
+        match decode_share_control(indication).ok()?.pdu {
+            ShareControlPdu::Data(ShareDataHeader {
+                share_data_pdu: ShareDataPdu::MonitorLayout(layout),
+                ..
+            }) => Some(layout.monitors),
+            _ => None,
+        }
+    });
+    // oracle: reference neutrinolabs/xrdp@5e7deccfe10770d3bef867f819d7a66434faf074:libxrdp/xrdp_caps.c (xrdp_caps_send_monitorlayout lists the client's monitor definitions as received)
+    assert_eq!(layout, Some(monitors));
 }
 
 async fn accept_spnego_credssp(
