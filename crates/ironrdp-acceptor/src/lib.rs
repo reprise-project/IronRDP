@@ -18,8 +18,8 @@ mod util;
 
 pub use ironrdp_connector::sspi::{AuthIdentity as CredsspAuthIdentity, UsernameParts};
 pub use ironrdp_connector::{ConnectorError, ConnectorErrorExt, ConnectorResult, DesktopSize};
-use ironrdp_pdu::nego;
 use ironrdp_pdu::rdp::client_info::ClientInfoFlags;
+use ironrdp_pdu::{gcc, nego};
 
 pub use self::channel_connection::{ChannelConnectionSequence, ChannelConnectionState};
 pub use self::connection::{
@@ -63,7 +63,7 @@ pub trait ConnectionSetupHandler {
         flags: ClientInfoFlags,
         performance_flags: ironrdp_pdu::rdp::client_info::PerformanceFlags,
         keyboard_layout: u32,
-        keyboard_type: ironrdp_pdu::gcc::KeyboardType,
+        keyboard_type: gcc::KeyboardType,
         keyboard_subtype: u32,
         keyboard_functional_keys_count: u32,
         ime_file_name: &str,
@@ -80,6 +80,23 @@ pub trait ConnectionSetupHandler {
             desktop_size,
         );
         Ok(())
+    }
+
+    /// Picks the desktop size offered in the Demand Active PDU and the Monitor Layout PDU after it.
+    ///
+    /// Called once, on the initial activation, before [`Self::prepare_capability_exchange`] receives the size.
+    /// `client_monitors` holds the client's [Client Monitor Data (TS_UD_CS_MONITOR), section 2.2.1.3.6], empty when it
+    /// sent none, and `desktop_size` is the size the acceptor would offer.
+    /// The Monitor Layout PDU lists `client_monitors` only when their bounding box spans the returned size.
+    ///
+    /// [Client Monitor Data (TS_UD_CS_MONITOR), section 2.2.1.3.6]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/a8029f8e-01e1-4f19-af67-bcad5bdef624
+    async fn choose_desktop_size(
+        &mut self,
+        client_monitors: &[gcc::Monitor],
+        desktop_size: DesktopSize,
+    ) -> DesktopSize {
+        let _ = client_monitors;
+        desktop_size
     }
 
     async fn prepare_capability_exchange(&mut self, desktop_size: DesktopSize) -> ConnectorResult<()> {
@@ -306,6 +323,12 @@ where
                 return Err(error);
             }
             acceptor.mark_credentials_handled();
+        }
+        if !acceptor.is_reactivation() && acceptor.is_ready_for_capability_exchange() {
+            let chosen = credentials_handler
+                .choose_desktop_size(acceptor.client_monitors(), acceptor.desktop_size())
+                .await;
+            acceptor.offer_desktop_size(chosen);
         }
         if !acceptor.is_reactivation()
             && !acceptor.is_auto_reconnect_attempt()
