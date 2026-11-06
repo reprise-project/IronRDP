@@ -236,6 +236,10 @@ pub struct ConnectionInfo {
     /// GCC Client Monitor Data (MS-RDPBCGR 2.2.1.3.6), not Client Core Data, and
     /// empty when the client sent none.
     pub client_monitors: Vec<ironrdp_pdu::gcc::Monitor>,
+    /// See [`ironrdp_acceptor::AcceptorResult::client_monitors_ex`]. Taken from
+    /// GCC Client Monitor Extended Data (MS-RDPBCGR 2.2.1.3.9), empty when the
+    /// client sent none.
+    pub client_monitors_ex: Vec<ironrdp_pdu::gcc::ExtendedMonitorInfo>,
     /// See [`ironrdp_acceptor::AcceptorResult::routing_token`].
     pub routing_token: Option<String>,
     /// The session the client asked to reconnect to in its GCC Client Cluster Data (MS-RDPBCGR 2.2.1.3.5), as a
@@ -277,6 +281,7 @@ impl ConnectionInfo {
             performance_flags: rdp::client_info::PerformanceFlags::empty(),
             auto_reconnect: false,
             client_monitors: Vec::new(),
+            client_monitors_ex: Vec::new(),
             routing_token: None,
             redirected_session_id: None,
             password_cookie: None,
@@ -5807,6 +5812,7 @@ impl RdpServer {
                     performance_flags: result.performance_flags,
                     auto_reconnect: is_auto_reconnect,
                     client_monitors: result.client_monitors,
+                    client_monitors_ex: result.client_monitors_ex,
                     routing_token: result.routing_token.clone(),
                     redirected_session_id: result
                         .client_cluster_data
