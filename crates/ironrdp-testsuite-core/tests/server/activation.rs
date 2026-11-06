@@ -4,7 +4,10 @@ use std::sync::{Arc, Mutex};
 
 use ironrdp_async::FramedWrite as _;
 use ironrdp_core::{WriteBuf, decode, encode_vec};
-use ironrdp_pdu::gcc::ClientNetworkData;
+use ironrdp_pdu::gcc::{
+    ClientGccBlocks, ClientMonitorData, ClientMonitorExtendedData, ClientNetworkData, ExtendedMonitorInfo, Monitor,
+    MonitorFlags, MonitorOrientation,
+};
 use ironrdp_pdu::input::MousePdu;
 use ironrdp_pdu::input::fast_path::{FastPathInput, FastPathInputEvent};
 use ironrdp_pdu::input::mouse::PointerFlags;
@@ -14,8 +17,8 @@ use ironrdp_pdu::rdp::capability_sets::CapabilitySet;
 use ironrdp_pdu::rdp::headers::{ShareControlHeader, ShareControlPdu};
 use ironrdp_pdu::x224::{X224, X224Data};
 use ironrdp_server::{
-    DesktopSize, DisplayContext, DisplayUpdate, KeyboardEvent, MouseEvent, RdpServer, RdpServerDisplay,
-    RdpServerDisplayUpdates, RdpServerInputHandler, ServerResult, TransportTls,
+    ConnectionHandler, ConnectionInfo, DesktopSize, DisplayContext, DisplayUpdate, KeyboardEvent, MouseEvent,
+    RdpServer, RdpServerDisplay, RdpServerDisplayUpdates, RdpServerInputHandler, ServerResult, TransportTls,
 };
 use ironrdp_testsuite_core::gcc::CLIENT_GCC_WITHOUT_OPTIONAL_FIELDS;
 use ironrdp_testsuite_core::rdp::{
@@ -72,6 +75,92 @@ async fn input_backlog_observes_the_negotiated_display_size() {
     }));
     let state = activate(true, &encode_vec(&input).unwrap()).await;
     assert_eq!(state.pointers, vec![(1234, 700, CLIENT_SIZE)]);
+}
+
+#[tokio::test]
+async fn client_monitors_ex_reaches_connection_info() {
+    let monitors_ex = vec![
+        ExtendedMonitorInfo {
+            physical_width: 600,
+            physical_height: 340,
+            orientation: MonitorOrientation::Landscape,
+            desktop_scale_factor: 150,
+            device_scale_factor: 140,
+        },
+        ExtendedMonitorInfo {
+            physical_width: 300,
+            physical_height: 530,
+            orientation: MonitorOrientation::Portrait,
+            desktop_scale_factor: 100,
+            device_scale_factor: 100,
+        },
+    ];
+    let mut blocks = client_blocks(None);
+    blocks.monitor = Some(ClientMonitorData {
+        monitors: vec![
+            Monitor {
+                left: 0,
+                top: 0,
+                right: 639,
+                bottom: 719,
+                flags: MonitorFlags::PRIMARY,
+            },
+            Monitor {
+                left: 640,
+                top: 0,
+                right: 1279,
+                bottom: 719,
+                flags: MonitorFlags::empty(),
+            },
+        ],
+    });
+    blocks.monitor_extended = Some(ClientMonitorExtendedData {
+        extended_monitors_info: monitors_ex.clone(),
+    });
+    let state = Arc::new(Mutex::new(DisplayState {
+        size: CLIENT_SIZE,
+        requests: Vec::new(),
+        pointers: Vec::new(),
+    }));
+    let recorded = Arc::new(Mutex::new(None));
+    let (activated_tx, activated_rx) = oneshot::channel();
+    let mut server = RdpServer::builder()
+        .with_addr(([127, 0, 0, 1], 0))
+        .with_no_security()
+        .with_input_handler(RecordingInput(Arc::clone(&state)))
+        .with_display_handler(RecordingDisplay {
+            state: Arc::clone(&state),
+            activated: Some(activated_tx),
+        })
+        .with_honor_client_desktop_size(Some(CLIENT_SIZE))
+        .with_connection_handler(Some(Box::new(MonitorsExRecorder(Arc::clone(&recorded)))))
+        .build();
+    let (client, server_side) = tokio::io::duplex(65536);
+    let client = async {
+        let mut framed = TokioFramed::new(client);
+        play_client_with_blocks(&mut framed, blocks).await;
+        activated_rx.await.expect("server entered the client loop");
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (_result, ()) = tokio::join!(
+            Box::pin(server.run_connection_with(server_side, TransportTls::AlreadyDone)),
+            client
+        );
+    })
+    .await
+    .expect("activation completed");
+
+    // oracle: spec MS-RDPBCGR §2.2.1.3.9 (the Client Monitor Extended Data the client sent)
+    assert_eq!(*recorded.lock().unwrap(), Some(monitors_ex));
+}
+
+/// Keeps the extended monitor data the connection info carried.
+struct MonitorsExRecorder(Arc<Mutex<Option<Vec<ExtendedMonitorInfo>>>>);
+
+impl ConnectionHandler for MonitorsExRecorder {
+    fn on_connection_info(&mut self, info: &ConnectionInfo) {
+        *self.0.lock().unwrap() = Some(info.client_monitors_ex.clone());
+    }
 }
 
 #[derive(Debug)]
@@ -190,14 +279,30 @@ where
     S: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
 {
     start_client_connection_request(framed).await;
-    play_client_after_connection_request_with_network(
+    play_client_after_connection_request_with_blocks(
         framed,
         desktop_resize_flag,
         input,
         remote_capabilities,
-        client_network_data,
+        client_blocks(client_network_data),
     )
     .await
+}
+
+/// Plays a client that sends `blocks` as its GCC Conference Create Request, at [`CLIENT_SIZE`].
+pub(super) async fn play_client_with_blocks<S>(framed: &mut TokioFramed<S>, blocks: ClientGccBlocks) -> ClientActivation
+where
+    S: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
+{
+    start_client_connection_request(framed).await;
+    play_client_after_connection_request_with_blocks(framed, true, &[], None, blocks).await
+}
+
+/// The client's GCC blocks with no optional ones but `network`.
+pub(super) fn client_blocks(network: Option<ClientNetworkData>) -> ClientGccBlocks {
+    let mut blocks = CLIENT_GCC_WITHOUT_OPTIONAL_FIELDS.clone();
+    blocks.network = network;
+    blocks
 }
 
 pub(super) async fn start_client_connection_request<S>(framed: &mut TokioFramed<S>)
@@ -223,20 +328,24 @@ pub(super) async fn play_client_after_connection_request<S>(
 where
     S: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
 {
-    play_client_after_connection_request_with_network(framed, desktop_resize_flag, input, remote_capabilities, None)
-        .await
-        .capabilities
+    play_client_after_connection_request_with_blocks(
+        framed,
+        desktop_resize_flag,
+        input,
+        remote_capabilities,
+        client_blocks(None),
+    )
+    .await
+    .capabilities
 }
 
-async fn play_client_after_connection_request_with_network(
+async fn play_client_after_connection_request_with_blocks(
     framed: &mut dyn ActivationFramed,
     desktop_resize_flag: bool,
     input: &[u8],
     remote_capabilities: Option<Vec<CapabilitySet>>,
-    client_network_data: Option<ClientNetworkData>,
+    mut blocks: ClientGccBlocks,
 ) -> ClientActivation {
-    let mut blocks = CLIENT_GCC_WITHOUT_OPTIONAL_FIELDS.clone();
-    blocks.network = client_network_data;
     blocks.core.desktop_width = CLIENT_SIZE.width;
     blocks.core.desktop_height = CLIENT_SIZE.height;
     let mut initial = WriteBuf::new();
