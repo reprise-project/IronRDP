@@ -167,8 +167,11 @@ fn decoded_password_cookie(cookie: &[u8]) -> (String, Option<PasswordCookie>) {
         password_cookie: Some(PasswordCookie(cookie.to_vec())),
         ..CLIENT_INFO_UNICODE.clone()
     };
-    let decoded: ClientInfo = decode(&encode_vec(&client_info).unwrap()).unwrap();
-    (decoded.credentials.password, decoded.password_cookie)
+    let mut decoded: ClientInfo = decode(&encode_vec(&client_info).unwrap()).unwrap();
+    (
+        core::mem::take(&mut decoded.credentials.password),
+        decoded.password_cookie,
+    )
 }
 
 // oracle: spec MS-RDPBCGR §2.2.13.1
