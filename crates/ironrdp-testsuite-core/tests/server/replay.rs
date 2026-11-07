@@ -135,3 +135,93 @@ fn credssp_done_with_gives_the_handler_the_user() {
     assert_eq!(received.credentials.password, "");
     assert_eq!(received.origin, CredentialOrigin::CredSspDelegated);
 }
+
+#[test]
+fn a_pdu_where_a_marker_is_due_is_an_error() {
+    let record = steps(&record(&mut acceptor(SecurityProtocol::HYBRID), client(true)));
+    let markers = record
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| !matches!(step, ReplayStep::Pdu { .. }))
+        .map(|(i, _)| i)
+        .collect::<Vec<_>>();
+    assert_eq!(markers.len(), 2, "a security upgrade and a CredSSP marker");
+
+    for i in markers {
+        let mut steps = record.clone();
+        steps[i] = ReplayStep::Pdu {
+            input: vec![],
+            output: vec![],
+        };
+
+        let error = acceptor(SecurityProtocol::HYBRID).replay(&steps).unwrap_err();
+
+        assert!(
+            error.to_string().contains(&format!("step {i} ")),
+            "error names step {i}: {error}"
+        );
+    }
+}
+
+#[test]
+fn a_marker_where_a_pdu_is_due_is_an_error() {
+    let record = steps(&record(&mut acceptor(SecurityProtocol::HYBRID), client(true)));
+    let i = record
+        .iter()
+        .rposition(|step| matches!(step, ReplayStep::Pdu { .. }))
+        .expect("a PDU step");
+
+    for marker in [
+        ReplayStep::SecurityUpgradeDone,
+        ReplayStep::CredsspDone {
+            username: "anna".into(),
+            domain: None,
+        },
+    ] {
+        let mut steps = record.clone();
+        steps[i] = marker;
+
+        let error = acceptor(SecurityProtocol::HYBRID).replay(&steps).unwrap_err();
+
+        assert!(
+            error.to_string().contains(&format!("step {i} ")),
+            "error names step {i}: {error}"
+        );
+    }
+}
+
+#[test]
+fn a_pdu_read_at_a_send_only_step_is_an_error() {
+    let record = record(&mut acceptor(SecurityProtocol::SSL), client(false));
+    let i = record
+        .iter()
+        .position(|(state, _)| *state == "BasicSettingsSendResponse")
+        .expect("an MCS Connect Response step");
+    let mut steps = steps(&record);
+    let ReplayStep::Pdu { input, .. } = &mut steps[i] else {
+        panic!("step {i} is a PDU");
+    };
+    *input = vec![0];
+
+    let error = acceptor(SecurityProtocol::SSL).replay(&steps).unwrap_err();
+
+    assert!(
+        error.to_string().contains(&format!("step {i} ")),
+        "error names step {i}: {error}"
+    );
+}
+
+#[test]
+fn a_pdu_steps_debug_shows_only_lengths() {
+    let step = ReplayStep::Pdu {
+        input: vec![0xde, 0xad, 0xbe, 0xef],
+        output: vec![0x5a, 0xa5],
+    };
+
+    let debug = format!("{step:?}");
+
+    assert_eq!(debug, "Pdu { input_len: 4, output_len: 2 }");
+    for byte in ["222", "173", "190", "239", "90", "165"] {
+        assert!(!debug.contains(byte), "{debug} holds no byte of the step");
+    }
+}
