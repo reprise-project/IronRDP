@@ -78,42 +78,67 @@ pub struct CredsspSequence<'a> {
     state: CredsspState,
 }
 
-#[derive(Debug)]
-struct CredentialsProxyImpl<'a> {
-    credentials: &'a AuthIdentity,
+/// Where CredSSP finds the credentials it checks a client against.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Source<'a> {
+    /// One identity, matched in full.
+    Fixed(&'a AuthIdentity),
+    /// Local accounts, matched by account name whatever domain or UPN suffix the client sends.
+    Users(&'a [AuthIdentity]),
 }
 
-impl<'a> CredentialsProxyImpl<'a> {
-    fn new(credentials: &'a AuthIdentity) -> Self {
-        Self { credentials }
-    }
+#[derive(Debug)]
+struct CredentialsProxyImpl<'a> {
+    source: Source<'a>,
 }
 
 impl CredentialsProxy for CredentialsProxyImpl<'_> {
     type AuthenticationData = AuthIdentity;
 
     fn auth_data_by_user(&mut self, username: &Username) -> std::io::Result<Self::AuthenticationData> {
-        if !usernames_match(&self.credentials.username, username) {
-            return Err(std::io::Error::other("invalid username"));
-        }
+        let password = match &self.source {
+            Source::Fixed(credentials) => {
+                if !usernames_match(&credentials.username, username) {
+                    return Err(std::io::Error::other("invalid username"));
+                }
+                credentials.password.clone()
+            }
+            Source::Users(users) => {
+                let account = account_name(username);
+                users
+                    .iter()
+                    .find(|user| account_name(&user.username).eq_ignore_ascii_case(account))
+                    .ok_or_else(|| std::io::Error::other("invalid username"))?
+                    .password
+                    .clone()
+            }
+        };
 
-        let mut data = self.credentials.clone();
         // keep the original user/domain
-        data.username = username.clone();
-        Ok(data)
+        Ok(AuthIdentity {
+            username: username.clone(),
+            password,
+        })
     }
 
     fn auth_data(&mut self) -> Result<Vec<Self::AuthenticationData>, std::io::Error> {
-        Ok(vec![self.credentials.clone()])
+        match self.source {
+            Source::Fixed(credentials) => Ok(vec![credentials.clone()]),
+            Source::Users(users) => Ok(users.to_vec()),
+        }
+    }
+}
+
+fn account_name(username: &Username) -> &str {
+    match username.parts() {
+        UsernameParts::UserPrincipalName(parts) => parts.account_name(),
+        UsernameParts::DownLevelLogonName(parts) => parts.account_name(),
     }
 }
 
 fn usernames_match(expected: &Username, requested: &Username) -> bool {
     let requested_parts = requested.parts();
-    let requested_account = match requested_parts {
-        UsernameParts::UserPrincipalName(parts) => parts.account_name(),
-        UsernameParts::DownLevelLogonName(parts) => parts.account_name(),
-    };
+    let requested_account = account_name(requested);
 
     match expected.parts() {
         UsernameParts::UserPrincipalName(expected_parts) => {
@@ -223,9 +248,20 @@ impl<'a> CredsspSequence<'a> {
         public_key: Vec<u8>,
         krb_config: Option<KerberosServerConfig>,
     ) -> ConnectorResult<Self> {
+        Self::with_source(Source::Fixed(creds), client_computer_name, public_key, krb_config)
+    }
+
+    /// [`CredsspSequence::init`] with the credentials taken from `source`.
+    pub(crate) fn with_source(
+        source: Source<'a>,
+        client_computer_name: ServerName,
+        public_key: Vec<u8>,
+        krb_config: Option<KerberosServerConfig>,
+    ) -> ConnectorResult<Self> {
         let client_computer_name = client_computer_name.into_inner();
         let new_server = |server_mode| {
-            CredSspServer::new(public_key.clone(), CredentialsProxyImpl::new(creds), server_mode)
+            let credentials = CredentialsProxyImpl { source };
+            CredSspServer::new(public_key.clone(), credentials, server_mode)
                 .map_err(|e| ConnectorError::new("CredSSP", ConnectorErrorKind::Credssp(e)))
         };
 
