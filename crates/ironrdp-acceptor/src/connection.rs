@@ -180,6 +180,7 @@ pub struct Acceptor {
     saved_for_reactivation: AcceptorState,
     pub(crate) creds: Option<Credentials>,
     pub(crate) credssp_backend: crate::CredsspBackend,
+    pub(crate) credssp_users: Option<Vec<Credentials>>,
     received_credentials: Option<ReceivedCredentials>,
     credentials_handled: bool,
     received_auto_reconnect: Option<ClientAutoReconnect>,
@@ -533,6 +534,7 @@ impl Acceptor {
             saved_for_reactivation: Default::default(),
             creds,
             credssp_backend: crate::CredsspBackend::default(),
+            credssp_users: None,
             received_credentials: None,
             credentials_handled: false,
             received_auto_reconnect: None,
@@ -601,6 +603,12 @@ impl Acceptor {
     /// Selects the CredSSP authentication provider before negotiation begins.
     pub fn set_credssp_backend(&mut self, backend: crate::CredsspBackend) {
         self.credssp_backend = backend;
+    }
+
+    /// Checks each CredSSP client against `users`, in place of the credentials given to [`Acceptor::new`]. A client
+    /// matches a user by account name, whatever its domain; a password may be an NT hash as `$NTLM$:<hex>`.
+    pub fn set_credssp_users(&mut self, users: Vec<Credentials>) {
+        self.credssp_users = Some(users);
     }
 
     /// Allows ClientInfo credentials to be validated by an external logon provider.
@@ -794,6 +802,7 @@ impl Acceptor {
             saved_for_reactivation,
             creds: consumed.creds,
             credssp_backend: consumed.credssp_backend,
+            credssp_users: consumed.credssp_users,
             received_credentials: consumed.received_credentials,
             credentials_handled: consumed.credentials_handled,
             received_auto_reconnect: consumed.received_auto_reconnect,

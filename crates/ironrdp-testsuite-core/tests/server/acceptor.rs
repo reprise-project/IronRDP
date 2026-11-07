@@ -16,7 +16,7 @@ use ironrdp_connector::credssp::CredsspSequence;
 use ironrdp_connector::sspi::credssp::{ClientMode, ClientState, CredSspClient, CredSspMode, NStatusCode, TsRequest};
 use ironrdp_connector::sspi::generator::{GeneratorState, NetworkRequest};
 use ironrdp_connector::sspi::ntlm::NtlmConfig;
-use ironrdp_connector::sspi::{AuthIdentity, NegotiateConfig, Username};
+use ironrdp_connector::sspi::{AuthIdentity, NTLM_HASH_PREFIX, NegotiateConfig, Username};
 use ironrdp_connector::{
     ConnectorError, ConnectorErrorExt as _, ConnectorErrorKind, ConnectorResult, DesktopSize, Sequence, Written,
     encode_x224_packet,
@@ -2423,7 +2423,15 @@ async fn accept_spnego_credssp(
     username: &str,
     password: &str,
 ) -> (ConnectorResult<()>, SetupHandler, Vec<Vec<u8>>) {
-    let mut acceptor = negotiated_acceptor(protocol);
+    run_spnego_credssp(&mut negotiated_acceptor(protocol), username, password).await
+}
+
+/// Runs CredSSP for an SPNEGO client as `username`/`password` against `acceptor`.
+async fn run_spnego_credssp(
+    acceptor: &mut Acceptor,
+    username: &str,
+    password: &str,
+) -> (ConnectorResult<()>, SetupHandler, Vec<Vec<u8>>) {
     let public_key = vec![0x42; 32];
     let mut client = spnego_credssp_client(username, password, &public_key);
     let first_message = spnego_credssp_message(&mut client, TsRequest::default());
@@ -2436,7 +2444,7 @@ async fn accept_spnego_credssp(
     let mut handler = SetupHandler::default();
     let result = accept_credssp_with(
         &mut framed,
-        &mut acceptor,
+        acceptor,
         &mut NoNetwork,
         "client.example.com".to_owned().into(),
         public_key,
@@ -2533,6 +2541,133 @@ async fn credssp_failed_spnego_logon_is_reported_as_logon_failure(#[case] userna
     assert!(handler.received.is_empty());
     let ts_request = TsRequest::from_buffer(outgoing.last().unwrap()).unwrap();
     assert_eq!(ts_request.error_code, Some(NStatusCode::LOGON_FAILURE));
+}
+
+/// The users CredSSP checks clients against, each with the NT hash of its password.
+const CREDSSP_USERS: [(&str, &str); 2] = [
+    ("anna", "37c40f9603acae8515078ec016e9c02d"), // anna-rd-pass
+    ("bert", "f84632917e3135b981715bccce7ea839"), // bert-rd-pass
+];
+
+fn credssp_users() -> Vec<Credentials> {
+    CREDSSP_USERS
+        .iter()
+        .map(|(user, hash)| Credentials {
+            username: (*user).to_owned(),
+            password: format!("{NTLM_HASH_PREFIX}{hash}"),
+            domain: None,
+        })
+        .collect()
+}
+
+/// A HYBRID acceptor past the security upgrade with no fixed identity, checking CredSSP against [`CREDSSP_USERS`].
+fn acceptor_with_credssp_users() -> Acceptor {
+    let mut acceptor = negotiated_acceptor_expecting(SecurityProtocol::HYBRID, None);
+    acceptor.set_credssp_users(credssp_users());
+    acceptor
+}
+
+/// Runs CredSSP for a bare NTLM client as `username`/`password` against [`acceptor_with_credssp_users`].
+/// Returns the result, the acceptor and the frames it wrote.
+async fn accept_credssp_from_user_list(
+    username: &str,
+    password: &str,
+) -> (ConnectorResult<()>, Acceptor, Vec<Vec<u8>>) {
+    let mut acceptor = acceptor_with_credssp_users();
+    let public_key = vec![0x42; 32];
+    let (mut client, request) = CredsspSequence::init(
+        ironrdp_connector::Credentials::UsernamePassword {
+            username: username.to_owned(),
+            password: password.to_owned(),
+        },
+        None,
+        SecurityProtocol::HYBRID,
+        "server.example.com".to_owned().into(),
+        public_key.clone(),
+        None,
+    )
+    .unwrap();
+    let mut framed = Framed::<HandshakeStream>::new(HandshakeStream {
+        incoming: [client_credssp_message(&mut client, request)].into(),
+        credssp_client: Some(client),
+        ..HandshakeStream::default()
+    });
+    let outgoing = Rc::clone(&framed.get_inner().0.outgoing);
+    let result = accept_credssp_with(
+        &mut framed,
+        &mut acceptor,
+        &mut NoNetwork,
+        "client.example.com".to_owned().into(),
+        public_key,
+        None,
+        &mut SetupHandler::default(),
+    )
+    .await;
+    let outgoing = outgoing.borrow().clone();
+    (result, acceptor, outgoing)
+}
+
+#[tokio::test]
+async fn credssp_finds_each_users_hash_in_the_list() {
+    let (result, acceptor, _) = accept_credssp_from_user_list("bert", "bert-rd-pass").await;
+
+    result.unwrap();
+    let received = acceptor.received_credentials().expect("CredSSP delegates the password");
+    assert_eq!(received.origin, ironrdp_acceptor::CredentialOrigin::CredSspDelegated);
+    assert_eq!(received.credentials.username, "bert");
+    assert_eq!(received.credentials.domain, None);
+    assert_eq!(received.credentials.password, "bert-rd-pass");
+}
+
+#[rstest::rstest]
+#[case::down_level("DOMAIN\\bert", "bert", Some("DOMAIN"))]
+#[case::upn("bert@host", "bert@host", None)]
+#[tokio::test]
+async fn credssp_matches_a_listed_user_by_account_name_whatever_the_domain(
+    #[case] sent: &str,
+    #[case] username: &str,
+    #[case] domain: Option<&str>,
+) {
+    let (result, acceptor, _) = accept_credssp_from_user_list(sent, "bert-rd-pass").await;
+
+    result.unwrap();
+    let received = acceptor.received_credentials().expect("CredSSP delegates the password");
+    assert_eq!(received.origin, ironrdp_acceptor::CredentialOrigin::CredSspDelegated);
+    assert_eq!(received.credentials.username, username);
+    assert_eq!(received.credentials.domain.as_deref(), domain);
+    assert_eq!(received.credentials.password, "bert-rd-pass");
+}
+
+#[tokio::test]
+async fn credssp_refuses_a_user_the_list_does_not_hold() {
+    let (result, acceptor, outgoing) = accept_credssp_from_user_list("carl", "carl-rd-pass").await;
+
+    assert!(result.is_err(), "an unknown user fails CredSSP");
+    assert!(acceptor.received_credentials().is_none());
+    let ts_request = TsRequest::from_buffer(outgoing.last().unwrap()).unwrap();
+    assert_eq!(ts_request.error_code, Some(NStatusCode::LOGON_FAILURE));
+}
+
+#[tokio::test]
+async fn credssp_refuses_a_wrong_password_for_a_listed_user() {
+    let (result, acceptor, outgoing) = accept_credssp_from_user_list("anna", "bert-rd-pass").await;
+
+    assert!(result.is_err(), "anna's hash does not accept bert's password");
+    assert!(acceptor.received_credentials().is_none());
+    let ts_request = TsRequest::from_buffer(outgoing.last().unwrap()).unwrap();
+    assert_eq!(ts_request.error_code, Some(NStatusCode::LOGON_FAILURE));
+}
+
+#[tokio::test]
+async fn credssp_spnego_client_finds_its_user_in_the_list() {
+    let mut acceptor = acceptor_with_credssp_users();
+    let (result, _, _) = run_spnego_credssp(&mut acceptor, "bert", "bert-rd-pass").await;
+
+    result.unwrap();
+    let received = acceptor.received_credentials().expect("CredSSP delegates the password");
+    assert_eq!(received.origin, ironrdp_acceptor::CredentialOrigin::CredSspDelegated);
+    assert_eq!(received.credentials.username, "bert");
+    assert_eq!(received.credentials.password, "bert-rd-pass");
 }
 
 #[cfg(windows)]
