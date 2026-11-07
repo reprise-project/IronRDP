@@ -7,6 +7,7 @@ use ironrdp_core::{
 };
 use num_derive::FromPrimitive;
 use num_traits::FromPrimitive as _;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::utils;
 use crate::utils::CharacterSet;
@@ -241,7 +242,7 @@ impl fmt::Debug for PasswordCookie {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct Credentials {
     pub username: String,
@@ -1136,7 +1137,9 @@ pub mod builder {
 mod tests {
     use ironrdp_core::{Decode as _, ReadCursor, decode, encode_vec};
 
-    use super::{ClientAutoReconnect, ExtendedClientOptionalInfo, PerformanceFlags, TimezoneInfo};
+    use zeroize::Zeroize as _;
+
+    use super::{ClientAutoReconnect, Credentials, ExtendedClientOptionalInfo, PerformanceFlags, TimezoneInfo};
 
     fn reconnect_cookie() -> [u8; 28] {
         let mut cookie = [0; 28];
@@ -1227,5 +1230,22 @@ mod tests {
             optional_info.auto_reconnect().map(|packet| packet.logon_id),
             Some(0x1234_5678)
         );
+    }
+
+    #[test]
+    fn credentials_wipe_on_drop() {
+        fn wiped<T: zeroize::ZeroizeOnDrop>() {}
+        wiped::<Credentials>();
+    }
+
+    #[test]
+    fn zeroizing_credentials_empties_the_password() {
+        let mut c = Credentials {
+            username: "user".to_owned(),
+            password: "secret".to_owned(),
+            domain: Some("domain".to_owned()),
+        };
+        c.zeroize();
+        assert!(c.password.is_empty());
     }
 }
