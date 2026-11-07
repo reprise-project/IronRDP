@@ -13,12 +13,13 @@ use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::Instant;
 
 use ironrdp_acceptor::{
-    Acceptor, AcceptorResult, BeginResult, ConnectionSetupHandler, ConnectorError, ConnectorErrorExt as _,
-    CredentialOrigin, CredsspBackend, DesktopSize, ReceivedCredentials,
+    Acceptor, AcceptorResult, AcceptorState, BeginResult, ConnectionSetupHandler, ConnectorError,
+    ConnectorErrorExt as _, CredentialOrigin, CredsspBackend, DesktopSize, ReceivedCredentials, ReplayStep,
 };
 use ironrdp_async::Framed;
 use ironrdp_cliprdr::CliprdrServer;
 use ironrdp_cliprdr::backend::ClipboardMessage;
+use ironrdp_connector::Sequence as _;
 use ironrdp_core::{Encode as _, WriteBuf, decode, encode_vec, impl_as_any};
 use ironrdp_displaycontrol::pdu::{DisplayControlCapabilities, DisplayControlMonitorLayout};
 use ironrdp_displaycontrol::server::DisplayControlServer;
@@ -2100,6 +2101,7 @@ impl PendingConnection {
                         acceptor,
                         local_addr: None,
                         authenticated_credentials: credentials_handler.authenticated_credentials,
+                        channels: None,
                     }))
                 }
                 // The stream is already past TLS (terminated at a lower
@@ -2113,6 +2115,7 @@ impl PendingConnection {
                         acceptor,
                         local_addr: None,
                         authenticated_credentials: credentials_handler.authenticated_credentials,
+                        channels: None,
                     }))
                 }
             },
@@ -2122,6 +2125,7 @@ impl PendingConnection {
                 acceptor,
                 local_addr: None,
                 authenticated_credentials: credentials_handler.authenticated_credentials,
+                channels: None,
             })),
         }
     }
@@ -2138,6 +2142,17 @@ struct NegotiatedConnection<S> {
     /// the server accepted itself; see [`RdpServer::set_connection_local_addr`].
     local_addr: Option<SocketAddr>,
     authenticated_credentials: Option<Credentials>,
+    /// Channel backends already attached to `acceptor`; `None` attaches them at finalization.
+    channels: Option<ConnectionState>,
+}
+
+/// A connection another process accepted up to Licensing, for [`RdpServer::run_connection_resumed`].
+#[derive(Debug, Clone)]
+pub struct Resumed {
+    /// The security protocols that process's acceptor offered.
+    pub security: nego::SecurityProtocol,
+    /// What that acceptor read and wrote, from the X.224 Connection Request through Client Info.
+    pub steps: Vec<ReplayStep>,
 }
 
 /// A negotiated TCP connection whose session has not started.
@@ -3902,6 +3917,65 @@ impl RdpServer {
         result
     }
 
+    /// Run a connection that another process accepted through Client Info and handed over past its TLS.
+    ///
+    /// The acceptor offers `resumed.security` and replays `resumed.steps`; its TLS is not this server's, so a server
+    /// built with [`RdpServerSecurity::None`] runs it. A reply that differs from the recording, or a recording that
+    /// stops anywhere but Licensing, is an error before anything is written to `stream`.
+    ///
+    /// The credential validator sees the Client Info credentials, or for CredSSP the user with an empty password,
+    /// at Licensing. The connection runs without UDP multitransport, and under `RdpServerSecurity::None` without
+    /// auto-reconnect cookies. Queued events are dropped as in [`run_connection_with`](Self::run_connection_with).
+    pub async fn run_connection_resumed<S>(&mut self, stream: S, resumed: Resumed) -> ServerResult<()>
+    where
+        S: AsyncRead + AsyncWrite + Send + Sync + Unpin,
+    {
+        self.connection_peer_addr = None;
+        let result = Box::pin(self.run_connection_resumed_inner(stream, resumed)).await;
+        self.connection_local_addr = None;
+        result
+    }
+
+    async fn run_connection_resumed_inner<S>(&mut self, stream: S, resumed: Resumed) -> ServerResult<()>
+    where
+        S: AsyncRead + AsyncWrite + Send + Sync + Unpin,
+    {
+        self.clear_bound_connection();
+        self.discard_stale_session_events().await;
+
+        let size = self.display.lock().await.size().await;
+        let capabilities = capabilities::capabilities(&self.opts, size);
+        let mut acceptor = Acceptor::new(resumed.security, size, capabilities, self.creds.clone());
+        acceptor.set_honor_client_desktop_size(self.opts.honor_client_desktop_size);
+        // Before the replay: Basic Settings gives channel IDs only to the static channels attached by then.
+        let channels = self.attach_channels(&mut acceptor).await;
+
+        acceptor
+            .replay(&resumed.steps)
+            .map_err_kind("replay", ServerErrorKind::Connector)?;
+        if !matches!(
+            acceptor.state().as_any().downcast_ref(),
+            Some(AcceptorState::LicensingExchange { .. })
+        ) {
+            return Err(ServerError::reason(
+                "replay",
+                format!(
+                    "the recording ends at {}, not LicensingExchange",
+                    acceptor.state().name()
+                ),
+            ));
+        }
+
+        self.finalize_negotiated(NegotiatedConnection {
+            transport: NegotiatedTransport::Offloaded(TokioFramed::new(stream)),
+            acceptor,
+            local_addr: None,
+            authenticated_credentials: None,
+            channels: Some(channels),
+        })
+        .await
+    }
+
     /// Completes negotiation and security setup without starting session finalization.
     ///
     /// The returned [`PendingSession`] owns the TCP connection until consumed or dropped.
@@ -4008,6 +4082,7 @@ impl RdpServer {
             acceptor,
             local_addr,
             authenticated_credentials,
+            channels,
         } = negotiated;
         self.clear_bound_connection();
         let _binding = BoundConnectionGuard {
@@ -4024,14 +4099,14 @@ impl RdpServer {
             // No security upgrade happened, so there is no TLS session to shut
             // down — matches the pre-existing `BeginResult::Continue` arm.
             NegotiatedTransport::Continued(framed) => {
-                self.accept_finalize(local_addr, framed, acceptor).await?;
+                self.accept_finalize(local_addr, framed, acceptor, channels).await?;
             }
             NegotiatedTransport::Tls(framed) => {
-                self.finalize_and_shutdown(local_addr, *framed, acceptor, "TLS connection")
+                self.finalize_and_shutdown(local_addr, *framed, acceptor, channels, "TLS connection")
                     .await?;
             }
             NegotiatedTransport::Offloaded(framed) => {
-                self.finalize_and_shutdown(local_addr, framed, acceptor, "TLS-offloaded stream")
+                self.finalize_and_shutdown(local_addr, framed, acceptor, channels, "TLS-offloaded stream")
                     .await?;
             }
         }
@@ -4048,6 +4123,7 @@ impl RdpServer {
         local_addr: Option<SocketAddr>,
         framed: TokioFramed<S>,
         acceptor: Acceptor,
+        channels: Option<ConnectionState>,
         shutdown_label: &str,
     ) -> ServerResult<()>
     where
@@ -4058,7 +4134,7 @@ impl RdpServer {
         // `PendingConnection::negotiate_and_authenticate` before this function
         // ever runs -- upstream's un-refactored equivalent still does that
         // work at this point, since it has no separate negotiation step.
-        let framed = self.accept_finalize(local_addr, framed, acceptor).await?;
+        let framed = self.accept_finalize(local_addr, framed, acceptor, channels).await?;
         debug!("Shutting down {}", shutdown_label);
         let (mut inner, _) = framed.into_inner();
         if let Err(e) = inner.shutdown().await {
@@ -6395,11 +6471,15 @@ impl RdpServer {
         local_addr: Option<SocketAddr>,
         mut framed: TokioFramed<S>,
         mut acceptor: Acceptor,
+        channels: Option<ConnectionState>,
     ) -> ServerResult<TokioFramed<S>>
     where
         S: AsyncRead + AsyncWrite + Sync + Send + Unpin,
     {
-        let mut conn = self.attach_channels(&mut acceptor).await;
+        let mut conn = match channels {
+            Some(conn) => conn,
+            None => self.attach_channels(&mut acceptor).await,
+        };
         let udp_bind_addr = self
             .opts
             .udp_bind_addr
