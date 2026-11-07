@@ -26,6 +26,9 @@ rand = "0.9"
 async-trait = "0.1"
 tracing = { version = "0.1", features = ["log"] }
 
+[features]
+__test = []
+
 [lints]
 workspace = true
 

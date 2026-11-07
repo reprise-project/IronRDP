@@ -83,7 +83,8 @@ pub struct CredsspSequence<'a> {
 pub(crate) enum Source<'a> {
     /// One identity, matched in full.
     Fixed(&'a AuthIdentity),
-    /// Local accounts, matched by account name whatever domain or UPN suffix the client sends.
+    /// Local accounts. Bare NTLM matches the account name and ignores the client's domain or UPN suffix;
+    /// SPNEGO filters `auth_data` first, so it needs an entry with the client's exact user and domain form.
     Users(&'a [AuthIdentity]),
 }
 

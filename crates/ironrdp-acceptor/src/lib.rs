@@ -500,6 +500,7 @@ where
         S: FramedRead + FramedWrite,
         N: NetworkClient,
     {
+        let users = acceptor.credssp_users.take();
         match acceptor.credssp_backend {
             CredsspBackend::Rust => {}
             #[cfg(windows)]
@@ -510,11 +511,9 @@ where
             }
         }
 
-        let identities;
         let identity;
-        let source = if let Some(users) = &acceptor.credssp_users {
-            identities = users.iter().map(auth_identity).collect::<ConnectorResult<Vec<_>>>()?;
-            credssp::Source::Users(&identities)
+        let source = if let Some(users) = &users {
+            credssp::Source::Users(users)
         } else {
             let creds = acceptor
                 .creds
