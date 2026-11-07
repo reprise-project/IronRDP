@@ -14,6 +14,7 @@ pub mod credssp;
 mod finalization;
 #[cfg(windows)]
 mod native_credssp;
+mod replay;
 mod util;
 
 pub use ironrdp_connector::sspi::{AuthIdentity as CredsspAuthIdentity, UsernameParts};
@@ -28,6 +29,7 @@ pub use self::connection::{
 };
 pub use self::credssp::CredsspBackend;
 pub use self::finalization::{FinalizationSequence, FinalizationState};
+pub use self::replay::ReplayStep;
 use crate::credssp::resolve_generator;
 
 pub enum BeginResult<S>
