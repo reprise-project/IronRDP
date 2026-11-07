@@ -4,7 +4,7 @@ use ironrdp_core::WriteBuf;
 use ironrdp_pdu::PduHint;
 use ironrdp_pdu::nego::SecurityProtocol;
 
-fn acceptor(protocol: SecurityProtocol) -> Acceptor {
+pub(super) fn acceptor(protocol: SecurityProtocol) -> Acceptor {
     Acceptor::new(
         protocol,
         DesktopSize {
@@ -16,7 +16,7 @@ fn acceptor(protocol: SecurityProtocol) -> Acceptor {
     )
 }
 
-fn client(enable_credssp: bool) -> ClientConnector {
+pub(super) fn client(enable_credssp: bool) -> ClientConnector {
     let mut config = crate::connector::test_config();
     config.credentials = Credentials::UsernamePassword {
         username: "anna".into(),
@@ -43,7 +43,7 @@ fn step(sequence: &mut dyn ironrdp_connector::Sequence, input: &[u8]) -> Vec<u8>
 
 /// Runs `client` against `acceptor` in memory until the acceptor has read Client Info, recording each
 /// acceptor step with the state it started in. Both sides skip TLS and CredSSP.
-fn record(acceptor: &mut Acceptor, mut client: ClientConnector) -> Vec<(&'static str, ReplayStep)> {
+pub(super) fn record(acceptor: &mut Acceptor, client: &mut ClientConnector) -> Vec<(&'static str, ReplayStep)> {
     let (mut to_server, mut to_client) = (Vec::new(), Vec::new());
     let mut record = Vec::new();
     while acceptor.client_info_flags().is_none() {
@@ -70,20 +70,20 @@ fn record(acceptor: &mut Acceptor, mut client: ClientConnector) -> Vec<(&'static
             client.mark_credssp_as_done();
         } else {
             let input = take_pdu(client.next_pdu_hint(), &mut to_client).expect("one side has a PDU to read");
-            to_server.extend_from_slice(&step(&mut client, &input));
+            to_server.extend_from_slice(&step(client, &input));
         }
     }
     record
 }
 
-fn steps(record: &[(&'static str, ReplayStep)]) -> Vec<ReplayStep> {
+pub(super) fn steps(record: &[(&'static str, ReplayStep)]) -> Vec<ReplayStep> {
     record.iter().map(|(_, step)| step.clone()).collect()
 }
 
 #[test]
 fn a_recorded_accept_replays_to_the_same_state() {
     let mut recorded = acceptor(SecurityProtocol::SSL);
-    let record = record(&mut recorded, client(false));
+    let record = record(&mut recorded, &mut client(false));
 
     let mut replayed = acceptor(SecurityProtocol::SSL);
     replayed.replay(&steps(&record)).unwrap();
@@ -99,7 +99,7 @@ fn a_recorded_accept_replays_to_the_same_state() {
 
 #[test]
 fn a_replay_whose_reply_differs_is_an_error() {
-    let record = record(&mut acceptor(SecurityProtocol::SSL), client(false));
+    let record = record(&mut acceptor(SecurityProtocol::SSL), &mut client(false));
     let i = record
         .iter()
         .position(|(state, _)| *state == "BasicSettingsSendResponse")
@@ -120,7 +120,7 @@ fn a_replay_whose_reply_differs_is_an_error() {
 
 #[test]
 fn credssp_done_with_gives_the_handler_the_user() {
-    let record = steps(&record(&mut acceptor(SecurityProtocol::HYBRID), client(true)));
+    let record = steps(&record(&mut acceptor(SecurityProtocol::HYBRID), &mut client(true)));
     assert!(record.contains(&ReplayStep::CredsspDone {
         username: "anna".into(),
         domain: None,
@@ -138,7 +138,7 @@ fn credssp_done_with_gives_the_handler_the_user() {
 
 #[test]
 fn a_pdu_where_a_marker_is_due_is_an_error() {
-    let record = steps(&record(&mut acceptor(SecurityProtocol::HYBRID), client(true)));
+    let record = steps(&record(&mut acceptor(SecurityProtocol::HYBRID), &mut client(true)));
     let markers = record
         .iter()
         .enumerate()
@@ -165,7 +165,7 @@ fn a_pdu_where_a_marker_is_due_is_an_error() {
 
 #[test]
 fn a_marker_where_a_pdu_is_due_is_an_error() {
-    let record = steps(&record(&mut acceptor(SecurityProtocol::HYBRID), client(true)));
+    let record = steps(&record(&mut acceptor(SecurityProtocol::HYBRID), &mut client(true)));
     let i = record
         .iter()
         .rposition(|step| matches!(step, ReplayStep::Pdu { .. }))
@@ -192,7 +192,7 @@ fn a_marker_where_a_pdu_is_due_is_an_error() {
 
 #[test]
 fn a_pdu_read_at_a_send_only_step_is_an_error() {
-    let record = record(&mut acceptor(SecurityProtocol::SSL), client(false));
+    let record = record(&mut acceptor(SecurityProtocol::SSL), &mut client(false));
     let i = record
         .iter()
         .position(|(state, _)| *state == "BasicSettingsSendResponse")
