@@ -6914,8 +6914,8 @@ async fn send_reason_and_ultimatum(
 /// Sends the MCS Disconnect Provider Ultimatum that ends a server-initiated
 /// disconnection (MS-RDPBCGR 1.3.1.4.2), best-effort.
 ///
-/// It tells a client that took no Set Error Info PDU that the server ended the
-/// connection on purpose: FreeRDP maps a provider-initiated ultimatum to
+/// It follows the Set Error Info PDU and tells a client that ignores that PDU
+/// that the server ended the connection on purpose: FreeRDP maps a provider-initiated ultimatum to
 /// `ERRINFO_RPC_INITIATED_DISCONNECT` and then does not auto-reconnect, as it
 /// does after a socket that just closes.
 async fn send_disconnect_ultimatum(writer: &mut impl FramedWrite) {
@@ -7178,7 +7178,7 @@ impl ConnectionSetupHandler for RdpServer {
 mod preempt_tests {
     use core::net::Ipv4Addr;
 
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::io::AsyncReadExt as _;
     use tokio::net::TcpListener;
 
     use super::*;
@@ -8121,7 +8121,7 @@ mod tests {
     use core::future::pending;
     use core::net::Ipv4Addr;
 
-    use ironrdp_core::{Encode as _, WriteCursor, impl_as_any};
+    use ironrdp_core::{WriteCursor, impl_as_any};
     use ironrdp_dvc::DvcProcessor as _;
     use ironrdp_svc::{SvcMessage, SvcServerProcessor};
 
@@ -8479,7 +8479,7 @@ mod cliprdr_timeout_tests {
         ClipboardPdu, ClipboardProtocolVersion, FileContentsRequest, FileContentsResponse, FormatDataRequest,
         FormatDataResponse, FormatList, LockDataId,
     };
-    use ironrdp_core::{Encode as _, WriteCursor, impl_as_any};
+    use ironrdp_core::{WriteCursor, impl_as_any};
 
     use super::cliprdr_error_tests::CapturingWriter;
     use super::*;
