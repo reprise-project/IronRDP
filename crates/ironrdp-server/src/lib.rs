@@ -43,7 +43,9 @@ pub use gfx::{EgfxServerMessage, GfxContext, GfxDvcBridge, GfxServerFactory, Gfx
 pub use handler::{KeyboardEvent, MouseButton, MouseEvent, RdpServerInputHandler};
 #[cfg(feature = "helper")]
 pub use helper::TlsIdentityCtx;
-pub use ironrdp_acceptor::{Acceptor, CredentialOrigin, CredsspAuthIdentity, CredsspBackend, ReceivedCredentials};
+pub use ironrdp_acceptor::{
+    Acceptor, CredentialOrigin, CredsspAuthIdentity, CredsspBackend, ReceivedCredentials, ReplayStep,
+};
 pub use ironrdp_pdu::rdp::server_error_info::ErrorInfo;
 pub use ironrdp_pdu::rdp::session_info::ServerAutoReconnect;
 #[cfg(feature = "usb")]
@@ -69,8 +71,9 @@ pub use server::{
     ConnectionInfo, ConnectionPolicy, ConnectionSource, CredentialDecision, CredentialValidationError,
     CredentialValidator, Credentials, DynamicChannelFactory, ErrorInfoDisconnectHandle, ExactMatchCredentialValidator,
     IncomingConnection, NextConnection, PendingSession, PostConnectionAction, RdpServer, RdpServerHandle,
-    RdpServerOptions, RdpServerSecurity, ServerEvent, ServerEventSender, ServerRedirectionHandle, SessionOutcome,
-    StaticChannelFactory, TransportTls, WindowingOrders, WindowingOrdersStatus, pick_remotefx_entropy_coder,
+    RdpServerOptions, RdpServerSecurity, Resumed, ServerEvent, ServerEventSender, ServerRedirectionHandle,
+    SessionOutcome, StaticChannelFactory, TransportTls, WindowingOrders, WindowingOrdersStatus,
+    pick_remotefx_entropy_coder,
 };
 #[cfg(feature = "__test")]
 pub use server::{SharedWriter, client_max_request_size, dispatch_static_channel_events, pick_remotefx_codec};
