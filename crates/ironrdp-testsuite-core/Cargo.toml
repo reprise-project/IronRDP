@@ -43,7 +43,7 @@ expect-test.workspace = true
 hex = "0.4"
 ironrdp-cliprdr-format.path = "../ironrdp-cliprdr-format"
 ironrdp-cliprdr = { path = "../ironrdp-cliprdr", features = ["__test"] }
-ironrdp-acceptor.path = "../ironrdp-acceptor"
+ironrdp-acceptor = { path = "../ironrdp-acceptor", features = ["__test"] }
 ironrdp-ainput.path = "../ironrdp-ainput"
 ironrdp-async.path = "../ironrdp-async"
 ironrdp-tokio.path = "../ironrdp-tokio"

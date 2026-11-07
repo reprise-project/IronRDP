@@ -180,7 +180,7 @@ pub struct Acceptor {
     saved_for_reactivation: AcceptorState,
     pub(crate) creds: Option<Credentials>,
     pub(crate) credssp_backend: crate::CredsspBackend,
-    pub(crate) credssp_users: Option<Vec<Credentials>>,
+    pub(crate) credssp_users: Option<Vec<AuthIdentity>>,
     received_credentials: Option<ReceivedCredentials>,
     credentials_handled: bool,
     received_auto_reconnect: Option<ClientAutoReconnect>,
@@ -605,10 +605,16 @@ impl Acceptor {
         self.credssp_backend = backend;
     }
 
-    /// Checks each CredSSP client against `users`, in place of the credentials given to [`Acceptor::new`]. A client
-    /// matches a user by account name, whatever its domain; a password may be an NT hash as `$NTLM$:<hex>`.
-    pub fn set_credssp_users(&mut self, users: Vec<Credentials>) {
+    /// Checks CredSSP against `users`, not `new`'s creds, and drops them when it ends. Passwords may be `$NTLM$:<hex>`.
+    /// Bare NTLM ignores the client's domain; SPNEGO needs an entry with the client's exact user and domain form.
+    pub fn set_credssp_users(&mut self, users: Vec<AuthIdentity>) {
         self.credssp_users = Some(users);
+    }
+
+    #[cfg(feature = "__test")]
+    #[doc(hidden)]
+    pub fn __test_holds_credssp_users(&self) -> bool {
+        self.credssp_users.is_some()
     }
 
     /// Allows ClientInfo credentials to be validated by an external logon provider.
@@ -802,7 +808,7 @@ impl Acceptor {
             saved_for_reactivation,
             creds: consumed.creds,
             credssp_backend: consumed.credssp_backend,
-            credssp_users: consumed.credssp_users,
+            credssp_users: None,
             received_credentials: consumed.received_credentials,
             credentials_handled: consumed.credentials_handled,
             received_auto_reconnect: consumed.received_auto_reconnect,

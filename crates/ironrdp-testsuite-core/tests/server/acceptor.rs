@@ -6,9 +6,9 @@ use std::io;
 use std::rc::Rc;
 
 use ironrdp_acceptor::{
-    Acceptor, AcceptorResult, ChannelConnectionSequence, ConnectionSetupHandler, FinalizationSequence,
-    MultitransportSecurityRng, ReceivedCredentials, accept_begin, accept_credssp_with, accept_finalize,
-    accept_finalize_with,
+    Acceptor, AcceptorResult, ChannelConnectionSequence, ConnectionSetupHandler, CredsspAuthIdentity,
+    FinalizationSequence, MultitransportSecurityRng, ReceivedCredentials, accept_begin, accept_credssp_with,
+    accept_finalize, accept_finalize_with,
 };
 use ironrdp_async::bytes::BytesMut;
 use ironrdp_async::{Framed, FramedRead, FramedWrite, NetworkClient, StreamWrapper};
@@ -2549,13 +2549,12 @@ const CREDSSP_USERS: [(&str, &str); 2] = [
     ("bert", "f84632917e3135b981715bccce7ea839"), // bert-rd-pass
 ];
 
-fn credssp_users() -> Vec<Credentials> {
+fn credssp_users() -> Vec<CredsspAuthIdentity> {
     CREDSSP_USERS
         .iter()
-        .map(|(user, hash)| Credentials {
-            username: (*user).to_owned(),
-            password: format!("{NTLM_HASH_PREFIX}{hash}"),
-            domain: None,
+        .map(|(user, hash)| CredsspAuthIdentity {
+            username: Username::new(user, None).unwrap(),
+            password: format!("{NTLM_HASH_PREFIX}{hash}").into(),
         })
         .collect()
 }
@@ -2623,7 +2622,7 @@ async fn credssp_finds_each_users_hash_in_the_list() {
 #[case::down_level("DOMAIN\\bert", "bert", Some("DOMAIN"))]
 #[case::upn("bert@host", "bert@host", None)]
 #[tokio::test]
-async fn credssp_matches_a_listed_user_by_account_name_whatever_the_domain(
+async fn credssp_bare_ntlm_matches_a_listed_user_by_account_name_whatever_the_domain(
     #[case] sent: &str,
     #[case] username: &str,
     #[case] domain: Option<&str>,
@@ -2656,6 +2655,24 @@ async fn credssp_refuses_a_wrong_password_for_a_listed_user() {
     assert!(acceptor.received_credentials().is_none());
     let ts_request = TsRequest::from_buffer(outgoing.last().unwrap()).unwrap();
     assert_eq!(ts_request.error_code, Some(NStatusCode::LOGON_FAILURE));
+}
+
+#[rstest::rstest]
+#[case::accepted("bert", "bert-rd-pass", true)]
+#[case::refused("carl", "carl-rd-pass", false)]
+#[tokio::test]
+async fn credssp_drops_the_user_list_when_it_ends(
+    #[case] username: &str,
+    #[case] password: &str,
+    #[case] accepted: bool,
+) {
+    let (result, acceptor, _) = accept_credssp_from_user_list(username, password).await;
+
+    assert_eq!(result.is_ok(), accepted);
+    assert!(
+        !acceptor.__test_holds_credssp_users(),
+        "the acceptor holds no user list after CredSSP"
+    );
 }
 
 #[tokio::test]
