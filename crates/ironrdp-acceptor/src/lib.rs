@@ -290,12 +290,8 @@ where
     let mut notified = acceptor.multitransport_request().is_some();
     let mut client_info_notified = acceptor.is_reactivation();
 
+    // Handlers run before each step, so an acceptor a replay left at Licensing still handles its credentials.
     loop {
-        if let Some(result) = acceptor.get_result() {
-            return Ok((framed, result));
-        }
-
-        acceptor_step(&mut framed, acceptor, &mut buf).await?;
         if !client_info_notified && let Some(flags) = acceptor.client_info_flags() {
             credentials_handler.handle_client_info(flags).await?;
             credentials_handler
@@ -354,6 +350,12 @@ where
             multitransport_handler(request, soft_sync).await;
             notified = true;
         }
+
+        if let Some(result) = acceptor.get_result() {
+            return Ok((framed, result));
+        }
+
+        acceptor_step(&mut framed, acceptor, &mut buf).await?;
     }
 }
 
