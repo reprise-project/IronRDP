@@ -12,7 +12,7 @@ mod license_exchange;
 mod remote_guard;
 mod server_core_data;
 
-fn test_config() -> ironrdp_connector::Config {
+pub(crate) fn test_config() -> ironrdp_connector::Config {
     ironrdp_connector::Config {
         desktop_size: DesktopSize {
             width: 1024,
