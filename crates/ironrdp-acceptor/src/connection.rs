@@ -23,6 +23,7 @@ use tracing::{debug, warn};
 
 use super::channel_connection::ChannelConnectionSequence;
 use super::finalization::{FinalizationSequence, InputEventBuffer};
+use crate::ReplayStep;
 use crate::util::{self, wrap_share_data};
 
 const IO_CHANNEL_ID: u16 = 1003;
@@ -1016,6 +1017,25 @@ impl Acceptor {
             .expect("transition to next state");
         debug_assert!(!self.should_perform_credssp());
         assert_eq!(res, Written::Nothing);
+    }
+
+    /// Brings a fresh acceptor to the state another acceptor reached through `steps`.
+    ///
+    /// Fails at the first step whose reply differs from the recorded one, or whose marker does not fit the state.
+    pub fn replay(&mut self, steps: &[ReplayStep]) -> ConnectorResult<()> {
+        crate::replay::replay(self, steps)
+    }
+
+    /// As [`Self::mark_credssp_as_done`], for a CredSSP exchange run elsewhere: `credentials` become
+    /// [`Self::received_credentials`], which the HYBRID Client Info step leaves in place.
+    ///
+    /// # Panics
+    ///
+    /// Panics if state is not [AcceptorState::Credssp].
+    pub fn mark_credssp_as_done_with(&mut self, credentials: ReceivedCredentials) {
+        self.mark_credssp_as_done();
+        self.received_credentials = Some(credentials);
+        self.credentials_handled = false;
     }
 
     pub fn get_result(&mut self) -> Option<AcceptorResult> {

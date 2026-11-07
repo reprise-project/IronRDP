@@ -11,7 +11,7 @@ mod license_exchange;
 #[cfg(feature = "remote-guard")]
 mod remote_guard;
 
-fn test_config() -> ironrdp_connector::Config {
+pub(crate) fn test_config() -> ironrdp_connector::Config {
     ironrdp_connector::Config {
         desktop_size: DesktopSize {
             width: 1024,

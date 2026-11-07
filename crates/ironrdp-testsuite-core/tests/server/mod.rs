@@ -21,5 +21,6 @@ mod remote_app;
 mod remotefx_codec_choice;
 mod remotefx_entropy_coder;
 mod remotefx_surface_command;
+mod replay;
 mod session_startup;
 mod tunnel_autodetect;
