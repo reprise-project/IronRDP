@@ -2825,7 +2825,7 @@ impl ConnectionState {
                 FastPathInputEvent::MouseEventEx(mouse) => mouse_output(mouse.into()),
                 FastPathInputEvent::MouseEventRel(mouse) => mouse_output(mouse.into()),
                 FastPathInputEvent::QoeEvent(quality) => {
-                    debug!(quality, "Received QoE");
+                    trace!(quality, "Received QoE");
                     None
                 }
             })
