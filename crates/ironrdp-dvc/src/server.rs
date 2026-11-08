@@ -530,9 +530,17 @@ impl Default for DrdynvcServer {
     }
 }
 
+/// The largest DRDYNVC message reassembled from a client: each carries one DVC PDU, which
+/// clients send in chunks of about 1600 bytes.
+const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
+
 impl SvcProcessor for DrdynvcServer {
     fn channel_name(&self) -> ChannelName {
         DrdynvcServer::NAME
+    }
+
+    fn max_message_size(&self) -> Option<usize> {
+        Some(MAX_MESSAGE_SIZE)
     }
 
     fn compression_condition(&self) -> CompressionCondition {

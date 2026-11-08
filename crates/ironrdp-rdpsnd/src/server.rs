@@ -485,9 +485,17 @@ fn negotiate_formats(
 
 impl_as_any!(RdpsndServer);
 
+/// The largest message reassembled from a client: its formats, confirmations and training
+/// replies are a few kilobytes at most.
+const MAX_MESSAGE_SIZE: usize = 256 * 1024;
+
 impl SvcProcessor for RdpsndServer {
     fn channel_name(&self) -> ChannelName {
         Self::NAME
+    }
+
+    fn max_message_size(&self) -> Option<usize> {
+        Some(MAX_MESSAGE_SIZE)
     }
 
     fn compression_condition(&self) -> CompressionCondition {
