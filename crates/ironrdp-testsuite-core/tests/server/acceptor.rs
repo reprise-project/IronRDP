@@ -3136,7 +3136,7 @@ async fn native_credssp_delegates_authenticated_local_credentials() {
         ironrdp_acceptor::CredentialOrigin::CredSspDelegated
     );
     let expected = Username::parse(&username).unwrap();
-    let ironrdp_connector::sspi::UsernameParts::DownLevelLogonName(parts) = expected.parts() else {
+    let sspi::UsernameParts::DownLevelLogonName(parts) = expected.parts() else {
         panic!("the fixture must use a local account");
     };
     assert_eq!(handler.received[0].credentials.username, parts.account_name());
