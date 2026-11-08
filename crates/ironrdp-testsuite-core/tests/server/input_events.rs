@@ -102,3 +102,37 @@ fn ainput_xbuttons_are_x1_and_x2() {
         }
     }
 }
+
+#[test]
+fn ainput_relative_buttons_carry_their_delta() {
+    let cases = [
+        (
+            MouseEventFlags::BUTTON1 | MouseEventFlags::DOWN,
+            MouseButton::Left,
+            true,
+        ),
+        (MouseEventFlags::BUTTON2, MouseButton::Right, false),
+        (
+            MouseEventFlags::BUTTON3 | MouseEventFlags::DOWN,
+            MouseButton::Middle,
+            true,
+        ),
+        (MouseEventFlags::XBUTTON1, MouseButton::X1, false),
+        (MouseEventFlags::XBUTTON2 | MouseEventFlags::DOWN, MouseButton::X2, true),
+    ];
+    for (flags, expected_button, expected_pressed) in cases {
+        let event: MouseEvent = AinputMousePdu {
+            time: 0,
+            flags: flags | MouseEventFlags::REL | MouseEventFlags::HAVE_REL,
+            x: -3,
+            y: 4,
+        }
+        .into();
+        match event {
+            MouseEvent::ButtonRel { x, y, button, pressed } => {
+                assert_eq!((x, y, button, pressed), (-3, 4, expected_button, expected_pressed));
+            }
+            other => panic!("{flags:?} decoded as {other:?}"),
+        }
+    }
+}
