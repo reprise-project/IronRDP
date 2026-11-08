@@ -1105,13 +1105,17 @@ struct DisplayControlBackend {
 }
 
 impl DisplayControlBackend {
-    /// Spawns the task that hands the client's layouts to `display` one at a time, in the order
-    /// the client sent them, so the last one sent is the one that stays.
+    /// Spawns the task that hands the client's layouts to `display` one at a time, in the order the client sent them,
+    /// so the last one sent is the one that stays.
+    /// The task holds the display only while it hands one over, so the display goes with the connection.
     fn new(display: Arc<Mutex<Box<dyn RdpServerDisplay>>>, monitor_count: u32) -> Self {
         let (layouts, mut rx) = mpsc::unbounded_channel::<DisplayControlMonitorLayout>();
+        let display = Arc::downgrade(&display);
         task::spawn(async move {
             while let Some(layout) = rx.recv().await {
-                let display = Arc::clone(&display);
+                let Some(display) = display.upgrade() else {
+                    break;
+                };
                 let _ = task::spawn_blocking(move || display.blocking_lock().request_layout(layout)).await;
             }
         });
@@ -8533,6 +8537,39 @@ mod tests {
             }
             assert_eq!(heard, widths);
         }
+    }
+
+    struct DroppedDisplay(Arc<AtomicBool>);
+
+    impl Drop for DroppedDisplay {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RdpServerDisplay for DroppedDisplay {
+        async fn size(&mut self) -> DesktopSize {
+            pending().await
+        }
+
+        async fn updates(&mut self, _: DisplayContext) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
+            pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_display_control_backend_leaves_the_display_to_its_owner() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let display: Arc<Mutex<Box<dyn RdpServerDisplay>>> =
+            Arc::new(Mutex::new(Box::new(DroppedDisplay(Arc::clone(&dropped)))));
+        let backend = DisplayControlBackend::new(Arc::clone(&display), 1);
+        drop(display);
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "the display goes with its last owner, not with the backend's task"
+        );
+        drop(backend);
     }
 
     struct PendingDisplay;
