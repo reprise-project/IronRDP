@@ -8499,24 +8499,40 @@ mod tests {
 
     #[tokio::test]
     async fn display_control_layouts_reach_the_display_in_the_order_sent() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let display: Arc<Mutex<Box<dyn RdpServerDisplay>>> = Arc::new(Mutex::new(Box::new(LayoutsDisplay(tx))));
-        let backend = DisplayControlBackend::new(Arc::clone(&display), 1);
-        let widths: Vec<u32> = (0..64).map(|i| 1024 + 2 * i).collect();
-        let held = display.lock().await;
-        for &width in &widths {
-            let layout = DisplayControlMonitorLayout::new_single_primary_monitor(width, 768, None, None)
-                .expect("a valid layout");
-            backend.monitor_layout(layout);
+        const LAYOUTS: usize = 64;
+        // Idle blocking threads race each other for new work, so layouts handed out one thread each lose their order.
+        let warm = Arc::new(std::sync::Barrier::new(LAYOUTS));
+        let threads: Vec<_> = core::iter::repeat_with(|| {
+            let warm = Arc::clone(&warm);
+            task::spawn_blocking(move || {
+                warm.wait();
+            })
+        })
+        .take(LAYOUTS)
+        .collect();
+        for thread in threads {
+            thread.await.expect("a warm-up thread ran");
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        drop(held);
-        let mut heard = Vec::new();
-        while heard.len() < widths.len() {
-            let next = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
-            heard.push(next.expect("every layout arrives").expect("the display is alive"));
+        let widths: Vec<u32> = (0..LAYOUTS).map(|i| 1024 + 2 * u32::try_from(i).unwrap()).collect();
+        for _ in 0..10 {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let display: Arc<Mutex<Box<dyn RdpServerDisplay>>> = Arc::new(Mutex::new(Box::new(LayoutsDisplay(tx))));
+            let backend = DisplayControlBackend::new(Arc::clone(&display), 1);
+            let held = display.lock().await;
+            for &width in &widths {
+                let layout = DisplayControlMonitorLayout::new_single_primary_monitor(width, 768, None, None)
+                    .expect("a valid layout");
+                backend.monitor_layout(layout);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            drop(held);
+            let mut heard = Vec::new();
+            while heard.len() < widths.len() {
+                let next = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+                heard.push(next.expect("every layout arrives").expect("the display is alive"));
+            }
+            assert_eq!(heard, widths);
         }
-        assert_eq!(heard, widths);
     }
 
     struct PendingDisplay;
