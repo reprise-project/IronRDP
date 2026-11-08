@@ -49,7 +49,9 @@ pub(crate) fn replay(acceptor: &mut Acceptor, steps: &[ReplayStep]) -> Connector
                     return Err(reason_err!("replay", "step {i} reads a PDU at a send-only state"));
                 }
                 buf.clear();
-                let written = acceptor.step(input, None, &mut buf)?;
+                let written = acceptor
+                    .step(input, None, &mut buf)
+                    .map_err(|e| reason_err!("replay", "step {i} failed").with_source(e))?;
                 if buf.filled()[..written.size().unwrap_or(0)] != output[..] {
                     return Err(reason_err!("replay", "diverged at step {i}"));
                 }
