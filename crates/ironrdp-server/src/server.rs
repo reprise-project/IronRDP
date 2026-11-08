@@ -6238,7 +6238,7 @@ impl RdpServer {
                 }
 
                 FastPathInputEvent::QoeEvent(quality) => {
-                    debug!("Received QoE: {}", quality);
+                    trace!(quality, "Received QoE");
                 }
             }
         }
