@@ -3,7 +3,7 @@ use core::fmt;
 use core::net::{IpAddr, SocketAddr};
 #[cfg(feature = "egfx")]
 use core::num::NonZeroU32;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use core::time::Duration;
 #[cfg(feature = "usb")]
 use std::collections::HashMap;
@@ -1044,23 +1044,50 @@ impl RdpServerSecurity {
 }
 
 struct AInputHandler {
-    events: mpsc::UnboundedSender<MouseEvent>,
+    handler: Arc<Mutex<Box<dyn RdpServerInputHandler>>>,
+    /// Events that found the handler locked, handed over in order by one task.
+    backlog: mpsc::UnboundedSender<MouseEvent>,
+    /// Events in `backlog` not yet handed over; while any are, later ones queue behind them.
+    waiting: Arc<AtomicUsize>,
     active: Arc<AtomicBool>,
 }
 
 impl_as_any!(AInputHandler);
 
 impl AInputHandler {
-    /// Spawns the task that hands the channel's mouse events to `handler` one at a time, in the
-    /// order the client sent them, so a press never overtakes the move before it.
+    /// Hands the channel's mouse events to `handler` as they are read, between the fast-path and
+    /// slow-path input around them, so Shift+click stays a Shift+click. An event that finds the
+    /// handler locked goes to a task that keeps the channel's own order.
     fn new(handler: Arc<Mutex<Box<dyn RdpServerInputHandler>>>, active: Arc<AtomicBool>) -> Self {
-        let (events, mut rx) = mpsc::unbounded_channel::<MouseEvent>();
-        task::spawn(async move {
-            while let Some(event) = rx.recv().await {
-                handler.lock().await.mouse(event);
+        let (backlog, mut rx) = mpsc::unbounded_channel::<MouseEvent>();
+        let waiting = Arc::new(AtomicUsize::new(0));
+        task::spawn({
+            let handler = Arc::clone(&handler);
+            let waiting = Arc::clone(&waiting);
+            async move {
+                while let Some(event) = rx.recv().await {
+                    handler.lock().await.mouse(event);
+                    waiting.fetch_sub(1, Ordering::AcqRel);
+                }
             }
         });
-        Self { events, active }
+        Self {
+            handler,
+            backlog,
+            waiting,
+            active,
+        }
+    }
+
+    fn deliver(&self, event: MouseEvent) {
+        if self.waiting.load(Ordering::Acquire) == 0
+            && let Ok(mut handler) = self.handler.try_lock()
+        {
+            handler.mouse(event);
+            return;
+        }
+        self.waiting.fetch_add(1, Ordering::AcqRel);
+        let _ = self.backlog.send(event);
     }
 }
 
@@ -1087,7 +1114,7 @@ impl dvc::DvcProcessor for AInputHandler {
         match decode(payload).map_err(|e| decode_err!(e))? {
             ClientPdu::Mouse(pdu) => {
                 self.active.store(true, Ordering::Release);
-                let _ = self.events.send(pdu.into());
+                self.deliver(pdu.into());
             }
         }
 
@@ -1098,20 +1125,28 @@ impl dvc::DvcProcessor for AInputHandler {
 impl dvc::DvcServerProcessor for AInputHandler {}
 
 struct DisplayControlBackend {
-    display: Arc<Mutex<Box<dyn RdpServerDisplay>>>,
+    layouts: mpsc::UnboundedSender<DisplayControlMonitorLayout>,
     monitor_count: u32,
 }
 
 impl DisplayControlBackend {
+    /// Spawns the task that hands the client's layouts to `display` one at a time, in the order
+    /// the client sent them, so the last one sent is the one that stays.
     fn new(display: Arc<Mutex<Box<dyn RdpServerDisplay>>>, monitor_count: u32) -> Self {
-        Self { display, monitor_count }
+        let (layouts, mut rx) = mpsc::unbounded_channel::<DisplayControlMonitorLayout>();
+        task::spawn(async move {
+            while let Some(layout) = rx.recv().await {
+                let display = Arc::clone(&display);
+                let _ = task::spawn_blocking(move || display.blocking_lock().request_layout(layout)).await;
+            }
+        });
+        Self { layouts, monitor_count }
     }
 }
 
 impl DisplayControlHandler for DisplayControlBackend {
     fn monitor_layout(&self, layout: DisplayControlMonitorLayout) {
-        let display = Arc::clone(&self.display);
-        task::spawn_blocking(move || display.blocking_lock().request_layout(layout));
+        let _ = self.layouts.send(layout);
     }
 
     fn capabilities(&self) -> PduResult<DisplayControlCapabilities> {
@@ -8389,6 +8424,101 @@ mod tests {
             (0..PDUS).collect::<Vec<_>>(),
             "moves and presses arrive in PDU order"
         );
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum Heard {
+        Key(u8),
+        Click,
+    }
+
+    struct HeardInput(mpsc::UnboundedSender<Heard>);
+
+    impl RdpServerInputHandler for HeardInput {
+        fn keyboard(&mut self, event: KeyboardEvent) {
+            if let KeyboardEvent::Pressed { code, .. } = event {
+                let _ = self.0.send(Heard::Key(code));
+            }
+        }
+        fn mouse(&mut self, event: MouseEvent) {
+            if let MouseEvent::Button { .. } = event {
+                let _ = self.0.send(Heard::Click);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_advanced_input_click_between_two_keys_stays_between_them() {
+        use ironrdp_ainput::{ClientPdu, MouseEventFlags, MousePdu};
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let input: Arc<Mutex<Box<dyn RdpServerInputHandler>>> = Arc::new(Mutex::new(Box::new(HeardInput(tx))));
+        let mut ainput = AInputHandler::new(Arc::clone(&input), Arc::new(AtomicBool::new(false)));
+        ainput.start(1).expect("AInput start failed");
+        let pdu = ClientPdu::Mouse(MousePdu {
+            time: 0,
+            flags: MouseEventFlags::BUTTON1 | MouseEventFlags::DOWN,
+            x: 1,
+            y: 1,
+        });
+        let mut click = vec![0; pdu.size()];
+        pdu.encode(&mut WriteCursor::new(&mut click))
+            .expect("AInput encoding failed");
+        let key = |code| KeyboardEvent::Pressed {
+            code,
+            extended: false,
+            extended1: false,
+        };
+
+        input.lock().await.keyboard(key(0x2A));
+        ainput.process(1, &click).expect("AInput processing failed");
+        input.lock().await.keyboard(key(0x1E));
+
+        let mut heard = Vec::new();
+        while heard.len() < 3 {
+            let next = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+            heard.push(next.expect("every event arrives").expect("the handler is alive"));
+        }
+        assert_eq!(heard, [Heard::Key(0x2A), Heard::Click, Heard::Key(0x1E)]);
+    }
+
+    struct LayoutsDisplay(mpsc::UnboundedSender<u32>);
+
+    #[async_trait::async_trait]
+    impl RdpServerDisplay for LayoutsDisplay {
+        async fn size(&mut self) -> DesktopSize {
+            pending().await
+        }
+
+        async fn updates(&mut self, _: DisplayContext) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
+            pending().await
+        }
+
+        fn request_layout(&mut self, layout: DisplayControlMonitorLayout) {
+            let _ = self.0.send(layout.monitors()[0].dimensions().0);
+        }
+    }
+
+    #[tokio::test]
+    async fn display_control_layouts_reach_the_display_in_the_order_sent() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let display: Arc<Mutex<Box<dyn RdpServerDisplay>>> = Arc::new(Mutex::new(Box::new(LayoutsDisplay(tx))));
+        let backend = DisplayControlBackend::new(Arc::clone(&display), 1);
+        let widths: Vec<u32> = (0..64).map(|i| 1024 + 2 * i).collect();
+        let held = display.lock().await;
+        for &width in &widths {
+            let layout = DisplayControlMonitorLayout::new_single_primary_monitor(width, 768, None, None)
+                .expect("a valid layout");
+            backend.monitor_layout(layout);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(held);
+        let mut heard = Vec::new();
+        while heard.len() < widths.len() {
+            let next = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+            heard.push(next.expect("every layout arrives").expect("the display is alive"));
+        }
+        assert_eq!(heard, widths);
     }
 
     struct PendingDisplay;
