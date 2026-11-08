@@ -209,6 +209,30 @@ async fn a_diverging_replay_ends_the_connection_with_an_error() {
         error.report()
     );
     assert!(read.is_empty(), "the client reads EOF and nothing else: {read:?}");
+
+    let mut steps = front(SecurityProtocol::SSL, &mut client(false));
+    let (index, input) = steps
+        .iter_mut()
+        .enumerate()
+        .find_map(|(i, step)| match step {
+            ReplayStep::Pdu { input, .. } if !input.is_empty() => Some((i, input)),
+            _ => None,
+        })
+        .expect("a step that reads");
+    *input = vec![0xff; 4];
+    let resumed = Resumed {
+        security: SecurityProtocol::SSL,
+        steps,
+    };
+    let (result, read) = resume_raw(&mut server, resumed).await;
+
+    let error = result.expect_err("an undecodable PDU is an error");
+    assert!(
+        error.report().to_string().contains(&format!("step {index}")),
+        "the error names step {index}: {}",
+        error.report()
+    );
+    assert!(read.is_empty(), "the client reads EOF and nothing else: {read:?}");
 }
 
 #[tokio::test]
