@@ -1043,6 +1043,15 @@ impl RdpServerSecurity {
     }
 }
 
+/// The clipboard channel `factory` builds, bounded as it asks.
+fn cliprdr_channel(factory: &dyn CliprdrServerFactory) -> CliprdrServer {
+    let cliprdr = CliprdrServer::new(factory.build_cliprdr_backend());
+    match factory.max_message_size() {
+        Some(limit) => cliprdr.with_max_message_size(limit),
+        None => cliprdr,
+    }
+}
+
 struct AInputHandler {
     handler: Arc<StdMutex<Box<dyn RdpServerInputHandler>>>,
     active: Arc<AtomicBool>,
@@ -3198,11 +3207,7 @@ impl RdpServer {
         let autodetect_handles = AutoDetectHandles::default();
 
         if let Some(cliprdr_factory) = self.cliprdr_factory.as_deref() {
-            let backend = cliprdr_factory.build_cliprdr_backend();
-
-            let cliprdr = CliprdrServer::new(backend);
-
-            acceptor.attach_static_channel(cliprdr);
+            acceptor.attach_static_channel(cliprdr_channel(cliprdr_factory));
         }
 
         if let Some(factory) = self.sound_factory.as_deref() {
@@ -8017,6 +8022,35 @@ mod cliprdr_error_tests {
             "the session must keep running after a refused clipboard message, got {state:?}"
         );
         assert!(writer.0.is_empty(), "a refused message has nothing to put on the wire");
+    }
+
+    struct LimitedClipboard(Option<usize>);
+
+    impl ironrdp_cliprdr::backend::CliprdrBackendFactory for LimitedClipboard {
+        fn build_cliprdr_backend(&self) -> Box<dyn CliprdrBackend> {
+            Box::new(SilentBackend)
+        }
+    }
+
+    impl ServerEventSender for LimitedClipboard {
+        fn set_sender(&mut self, _sender: mpsc::UnboundedSender<ServerEvent>) {}
+    }
+
+    impl CliprdrServerFactory for LimitedClipboard {
+        fn max_message_size(&self) -> Option<usize> {
+            self.0
+        }
+    }
+
+    #[test]
+    fn the_clipboard_channel_takes_its_factorys_limit() {
+        use ironrdp_svc::SvcProcessor as _;
+
+        assert_eq!(
+            cliprdr_channel(&LimitedClipboard(Some(1 << 20))).max_message_size(),
+            Some(1 << 20)
+        );
+        assert_eq!(cliprdr_channel(&LimitedClipboard(None)).max_message_size(), None);
     }
 }
 
