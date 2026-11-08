@@ -1044,11 +1044,25 @@ impl RdpServerSecurity {
 }
 
 struct AInputHandler {
-    handler: Arc<Mutex<Box<dyn RdpServerInputHandler>>>,
+    events: mpsc::UnboundedSender<MouseEvent>,
     active: Arc<AtomicBool>,
 }
 
 impl_as_any!(AInputHandler);
+
+impl AInputHandler {
+    /// Spawns the task that hands the channel's mouse events to `handler` one at a time, in the
+    /// order the client sent them, so a press never overtakes the move before it.
+    fn new(handler: Arc<Mutex<Box<dyn RdpServerInputHandler>>>, active: Arc<AtomicBool>) -> Self {
+        let (events, mut rx) = mpsc::unbounded_channel::<MouseEvent>();
+        task::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                handler.lock().await.mouse(event);
+            }
+        });
+        Self { events, active }
+    }
+}
 
 impl dvc::DvcProcessor for AInputHandler {
     fn channel_name(&self) -> &str {
@@ -1073,10 +1087,7 @@ impl dvc::DvcProcessor for AInputHandler {
         match decode(payload).map_err(|e| decode_err!(e))? {
             ClientPdu::Mouse(pdu) => {
                 self.active.store(true, Ordering::Release);
-                let handler = Arc::clone(&self.handler);
-                task::spawn_blocking(move || {
-                    handler.blocking_lock().mouse(pdu.into());
-                });
+                let _ = self.events.send(pdu.into());
             }
         }
 
@@ -3185,10 +3196,10 @@ impl RdpServer {
             acceptor.attach_static_channel(RdpdrServer::new(backend));
         }
 
-        let dvc = dvc::DrdynvcServer::new().with_dynamic_channel(AInputHandler {
-            handler: Arc::clone(&self.handler),
-            active: Arc::clone(&self.advanced_input_active),
-        });
+        let dvc = dvc::DrdynvcServer::new().with_dynamic_channel(AInputHandler::new(
+            Arc::clone(&self.handler),
+            Arc::clone(&self.advanced_input_active),
+        ));
 
         // `monitor_count` is only asked when the channel is offered, since its
         // contract is tied to the channel opening. Both queries share one guard,
@@ -8293,10 +8304,7 @@ mod tests {
         use ironrdp_ainput::{ClientPdu, MouseEventFlags, MousePdu};
 
         let active = Arc::new(AtomicBool::new(false));
-        let mut handler = AInputHandler {
-            handler: Arc::new(Mutex::new(Box::new(NoopInput))),
-            active: Arc::clone(&active),
-        };
+        let mut handler = AInputHandler::new(Arc::new(Mutex::new(Box::new(NoopInput))), Arc::clone(&active));
 
         handler.start(1).expect("AInput start failed");
         assert!(!active.load(Ordering::Acquire));
@@ -8315,6 +8323,63 @@ mod tests {
 
         handler.close(1);
         assert!(!active.load(Ordering::Acquire));
+    }
+
+    struct RecordedInput(mpsc::UnboundedSender<MouseEvent>);
+
+    impl RdpServerInputHandler for RecordedInput {
+        fn keyboard(&mut self, _event: KeyboardEvent) {}
+        fn mouse(&mut self, event: MouseEvent) {
+            let _ = self.0.send(event);
+        }
+    }
+
+    #[tokio::test]
+    async fn advanced_input_pdus_reach_the_handler_in_order() {
+        use ironrdp_ainput::{ClientPdu, MouseEventFlags, MousePdu};
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut handler = AInputHandler::new(
+            Arc::new(Mutex::new(Box::new(RecordedInput(tx)))),
+            Arc::new(AtomicBool::new(false)),
+        );
+        handler.start(1).expect("AInput start failed");
+
+        const PDUS: i32 = 400;
+        for x in 0..PDUS {
+            let flags = if x % 2 == 0 {
+                MouseEventFlags::MOVE
+            } else {
+                MouseEventFlags::BUTTON1 | MouseEventFlags::DOWN
+            };
+            let pdu = ClientPdu::Mouse(MousePdu {
+                time: 0,
+                flags,
+                x,
+                y: 0,
+            });
+            let mut payload = vec![0; pdu.size()];
+            pdu.encode(&mut WriteCursor::new(&mut payload))
+                .expect("AInput encoding failed");
+            handler.process(1, &payload).expect("AInput processing failed");
+        }
+
+        let mut seen = Vec::new();
+        while seen.len() < usize::try_from(PDUS).unwrap() {
+            let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("the handler got every PDU")
+                .expect("the handler is alive");
+            seen.push(match event {
+                MouseEvent::Move { x, .. } | MouseEvent::Button { x, .. } => i32::from(x),
+                other => panic!("unexpected {other:?}"),
+            });
+        }
+        assert_eq!(
+            seen,
+            (0..PDUS).collect::<Vec<_>>(),
+            "moves and presses arrive in PDU order"
+        );
     }
 
     struct PendingDisplay;
