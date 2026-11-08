@@ -24,6 +24,11 @@ name = "integration_tests_core"
 path = "tests/main.rs"
 harness = true
 
+[[test]]
+name = "decode_string_alloc"
+path = "tests/decode_string_alloc.rs"
+harness = true
+
 [dependencies]
 array-concat = "0.5"
 expect-test = "1"
