@@ -255,7 +255,22 @@ async fn activate(desktop_resize_flag: bool, input: &[u8]) -> DisplayState {
     .await
     .expect("activation completed");
     drop(server);
-    Arc::try_unwrap(state).unwrap().into_inner().unwrap()
+    // The connection's advanced input task holds the input handler until it sees its channel close.
+    let state = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut state = state;
+        loop {
+            match Arc::try_unwrap(state) {
+                Ok(state) => break state,
+                Err(shared) => {
+                    state = shared;
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+    })
+    .await
+    .expect("the server released the handlers");
+    state.into_inner().unwrap()
 }
 
 async fn play_client(framed: &mut TokioFramed<DuplexStream>, desktop_resize_flag: bool, input: &[u8]) {
