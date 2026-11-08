@@ -16,7 +16,7 @@ use ironrdp_connector::credssp::CredsspSequence;
 use ironrdp_connector::sspi::credssp::{ClientMode, ClientState, CredSspClient, CredSspMode, NStatusCode, TsRequest};
 use ironrdp_connector::sspi::generator::{GeneratorState, NetworkRequest};
 use ironrdp_connector::sspi::ntlm::NtlmConfig;
-use ironrdp_connector::sspi::{AuthIdentity, NTLM_HASH_PREFIX, NegotiateConfig, Username};
+use ironrdp_connector::sspi::{self, AuthIdentity, NTLM_HASH_PREFIX, NegotiateConfig, Username};
 use ironrdp_connector::{
     ConnectorError, ConnectorErrorExt as _, ConnectorErrorKind, ConnectorResult, DesktopSize, Sequence, Written,
     encode_x224_packet,
@@ -2035,33 +2035,71 @@ async fn credssp_failed_logon_is_reported_as_logon_failure(
     assert_eq!(ts_request.error_code, Some(NStatusCode::LOGON_FAILURE));
 }
 
-/// Runs one client message through the server's CredSSP sequence, outside the panic guard
-/// of `accept_credssp_with`.
-fn credssp_server_step(
-    server: &mut ironrdp_acceptor::credssp::CredsspSequence<'_>,
-    message: &[u8],
-) -> ConnectorResult<Vec<u8>> {
-    let Some(request) = server.decode_client_message(message)? else {
-        return Ok(Vec::new());
-    };
-    let result = {
-        let mut generator = server.process_ts_request(request);
-        let GeneratorState::Completed(result) = generator.start() else {
-            panic!("NTLM should not make network requests");
-        };
-        result
-    };
-    let mut buf = WriteBuf::new();
-    server.handle_process_result(result, &mut buf)?;
-    Ok(buf.filled().to_vec())
+/// Which framing a hand-driven CredSSP client puts its NTLM messages in.
+#[derive(Clone, Copy, Debug)]
+enum Wrapping {
+    /// Bare NTLM, as the connector's client sends it.
+    Bare,
+    /// NTLM wrapped in SPNEGO, as mstsc sends it.
+    Spnego,
 }
 
-/// A client's pubKeyAuth shorter than an NTLM signature (16 bytes) ends CredSSP with an error.
-#[rstest::rstest]
-#[case(0)]
-#[case(8)]
-#[case(15)]
-fn credssp_refuses_a_public_key_proof_shorter_than_a_signature(#[case] length: usize) {
+enum HandClient {
+    Bare(Box<CredsspSequence>),
+    Spnego(Box<CredSspClient>),
+}
+
+impl HandClient {
+    /// Returns the client and its first message.
+    fn start(wrapping: Wrapping, username: &str, password: &str, public_key: &[u8]) -> (Self, Vec<u8>) {
+        match wrapping {
+            Wrapping::Bare => {
+                let (mut client, request) = CredsspSequence::init(
+                    ironrdp_connector::Credentials::UsernamePassword {
+                        username: username.to_owned(),
+                        password: password.to_owned(),
+                    },
+                    None,
+                    SecurityProtocol::HYBRID,
+                    "server.example.com".to_owned().into(),
+                    public_key.to_vec(),
+                    None,
+                )
+                .unwrap();
+                let message = client_credssp_message(&mut client, request);
+                (Self::Bare(Box::new(client)), message)
+            }
+            Wrapping::Spnego => {
+                let mut client = spnego_credssp_client(username, password, public_key);
+                let message = spnego_credssp_message(&mut client, TsRequest::default());
+                (Self::Spnego(Box::new(client)), message)
+            }
+        }
+    }
+
+    fn answer(&mut self, reply: &[u8]) -> Vec<u8> {
+        match self {
+            Self::Bare(client) => {
+                let request = client.decode_server_message(reply).unwrap().unwrap();
+                client_credssp_message(client, request)
+            }
+            Self::Spnego(client) => spnego_credssp_message(client, TsRequest::from_buffer(reply).unwrap()),
+        }
+    }
+}
+
+enum Exchange {
+    Accepted,
+    /// The server's last answer and the error its sequence ended on.
+    Refused {
+        reply: Vec<u8>,
+        error: ConnectorError,
+    },
+}
+
+/// Runs CredSSP between a client logging on as `username`/`password` and the acceptor's sequence for alice/secret,
+/// outside the panic guard of `accept_credssp_with`.
+fn hand_driven_credssp(wrapping: Wrapping, username: &str, password: &str, alteration: Alteration) -> Exchange {
     let public_key = vec![0x42; 32];
     let identity = AuthIdentity {
         username: Username::new("alice", None).unwrap(),
@@ -2074,37 +2112,201 @@ fn credssp_refuses_a_public_key_proof_shorter_than_a_signature(#[case] length: u
         None,
     )
     .unwrap();
-    let (mut client, request) = CredsspSequence::init(
-        ironrdp_connector::Credentials::UsernamePassword {
-            username: "alice".to_owned(),
-            password: "secret".to_owned(),
-        },
-        None,
-        SecurityProtocol::HYBRID,
-        "server.example.com".to_owned().into(),
-        public_key,
-        None,
-    )
-    .unwrap();
+    let (mut client, mut message) = HandClient::start(wrapping, username, password, &public_key);
 
-    let mut message = client_credssp_message(&mut client, request);
+    let mut step = 0;
     loop {
-        let mut request = TsRequest::from_buffer(&message).unwrap();
-        if let Some(proof) = request.pub_key_auth.as_mut() {
-            proof.truncate(length);
-            message.clear();
-            request.encode_ts_request(&mut message).unwrap();
-            break;
+        alteration.apply(step, &mut message);
+        let request = match server.decode_client_message(&message) {
+            Ok(request) => request.expect("the server reads every client message"),
+            Err(error) => {
+                return Exchange::Refused {
+                    reply: Vec::new(),
+                    error,
+                };
+            }
+        };
+        let result = {
+            let mut generator = server.process_ts_request(request);
+            let GeneratorState::Completed(result) = generator.start() else {
+                panic!("NTLM should not make network requests");
+            };
+            result
+        };
+        let mut buf = WriteBuf::new();
+        server.handle_process_result(result, &mut buf).unwrap();
+        let reply = buf.filled().to_vec();
+        match server.next_pdu_hint() {
+            Err(error) => return Exchange::Refused { reply, error },
+            Ok(None) => return Exchange::Accepted,
+            Ok(Some(_)) => message = client.answer(&reply),
         }
-        let reply = credssp_server_step(&mut server, &message).unwrap();
-        let request = client.decode_server_message(&reply).unwrap().unwrap();
-        message = client_credssp_message(&mut client, request);
+        step += 1;
     }
+}
 
-    assert!(
-        credssp_server_step(&mut server, &message).is_err(),
-        "a {length}-byte pubKeyAuth should end CredSSP with an error"
-    );
+/// The sspi error kind somewhere in `error`'s source chain.
+fn sspi_error_kind(error: &ConnectorError) -> Option<sspi::ErrorKind> {
+    let error: &dyn core::error::Error = error;
+    core::iter::successors(Some(error), |error| error.source())
+        .find_map(|error| error.downcast_ref::<sspi::Error>())
+        .map(|error| error.error_type)
+}
+
+/// The answer to a failed logon: a TsRequest that carries STATUS_LOGON_FAILURE and nothing else.
+fn logon_failure_answer() -> Vec<u8> {
+    let mut answer = Vec::new();
+    TsRequest {
+        error_code: Some(NStatusCode::LOGON_FAILURE),
+        ..TsRequest::default()
+    }
+    .encode_ts_request(&mut answer)
+    .unwrap();
+    answer
+}
+
+fn edit_ts_request(message: &mut Vec<u8>, edit: impl FnOnce(&mut TsRequest)) {
+    let mut request = TsRequest::from_buffer(message).unwrap();
+    edit(&mut request);
+    message.clear();
+    request.encode_ts_request(message).unwrap();
+}
+
+fn find_once(haystack: &[u8], needle: &[u8]) -> usize {
+    let mut found = haystack
+        .windows(needle.len())
+        .enumerate()
+        .filter(|(_, window)| *window == needle)
+        .map(|(at, _)| at);
+    let at = found.next().expect("the message holds the pattern");
+    assert!(found.next().is_none(), "the message holds the pattern once");
+    at
+}
+
+/// Clears the MIC bit of the MsvAvFlags AV pair in the client's NTLMv2 response ([MS-NLMP] 2.2.2.1), keeping every
+/// length, so that the AUTHENTICATE no longer says it carries a MIC.
+fn clear_mic_flag(message: &mut [u8]) {
+    const AV_FLAGS_WITH_MIC: [u8; 8] = [0x06, 0x00, 0x04, 0x00, 0x02, 0x00, 0x00, 0x00];
+    let at = find_once(message, &AV_FLAGS_WITH_MIC);
+    message[at + 4] = 0;
+}
+
+/// Clears NTLMSSP_NEGOTIATE_TARGET_INFO (0x0080_0000) in the AUTHENTICATE's NegotiateFlags, the u32 at offset 60
+/// ([MS-NLMP] 2.2.1.3, 2.2.2.5), so that the 16 bytes after the Version are no longer read as a MIC.
+fn clear_target_info_flag(message: &mut [u8]) {
+    let at = find_once(message, b"NTLMSSP\0\x03\0\0\0");
+    message[at + 62] &= !0x80;
+}
+
+/// A change to the client's messages that makes the logon fail after its AUTHENTICATE.
+#[derive(Clone, Copy, Debug)]
+enum Alteration {
+    None,
+    AuthenticateWithoutMicFlag,
+    AuthenticateWithoutTargetInfo,
+    PublicKeyProofEmpty,
+    PublicKeyProofCutTo15Bytes,
+    PublicKeyProofAltered,
+    CredentialsAltered,
+}
+
+impl Alteration {
+    /// Rewrites client message `step`, numbered from 0, before the server reads it.
+    fn apply(self, step: usize, message: &mut Vec<u8>) {
+        match (self, step) {
+            (Self::AuthenticateWithoutMicFlag, 1) => clear_mic_flag(message),
+            (Self::AuthenticateWithoutTargetInfo, 1) => clear_target_info_flag(message),
+            (Self::PublicKeyProofEmpty, 1) => {
+                edit_ts_request(message, |request| request.pub_key_auth.as_mut().unwrap().clear());
+            }
+            (Self::PublicKeyProofCutTo15Bytes, 1) => {
+                edit_ts_request(message, |request| request.pub_key_auth.as_mut().unwrap().truncate(15));
+            }
+            (Self::PublicKeyProofAltered, 1) => edit_ts_request(message, |request| {
+                *request.pub_key_auth.as_mut().unwrap().last_mut().unwrap() ^= 1;
+            }),
+            (Self::CredentialsAltered, 2) => edit_ts_request(message, |request| {
+                *request.auth_info.as_mut().unwrap().last_mut().unwrap() ^= 1;
+            }),
+            _ => {}
+        }
+    }
+}
+
+/// Once the client has sent its NTLM AUTHENTICATE, every failure gets the same answer, so that it tells neither
+/// whether the account exists nor which check refused the logon. The server's own error keeps the reason.
+#[rstest::rstest]
+#[case::wrong_password(Wrapping::Bare, "alice", "wrong", Alteration::None, sspi::ErrorKind::LogonDenied)]
+#[case::unknown_user(Wrapping::Bare, "bob", "secret", Alteration::None, sspi::ErrorKind::LogonDenied)]
+#[case::spnego_wrong_password(Wrapping::Spnego, "alice", "wrong", Alteration::None, sspi::ErrorKind::LogonDenied)]
+#[case::spnego_unknown_user(Wrapping::Spnego, "bob", "secret", Alteration::None, sspi::ErrorKind::NoCredentials)]
+#[case::wrong_password_without_mic(
+    Wrapping::Bare,
+    "alice",
+    "wrong",
+    Alteration::AuthenticateWithoutMicFlag,
+    sspi::ErrorKind::InvalidToken
+)]
+#[case::public_key_proof_empty(
+    Wrapping::Bare,
+    "alice",
+    "secret",
+    Alteration::PublicKeyProofEmpty,
+    sspi::ErrorKind::InvalidToken
+)]
+#[case::public_key_proof_shorter_than_a_signature(
+    Wrapping::Bare,
+    "alice",
+    "secret",
+    Alteration::PublicKeyProofCutTo15Bytes,
+    sspi::ErrorKind::InvalidToken
+)]
+#[case::public_key_proof_altered(
+    Wrapping::Bare,
+    "alice",
+    "secret",
+    Alteration::PublicKeyProofAltered,
+    sspi::ErrorKind::MessageAltered
+)]
+#[case::credentials_altered(
+    Wrapping::Bare,
+    "alice",
+    "secret",
+    Alteration::CredentialsAltered,
+    sspi::ErrorKind::MessageAltered
+)]
+fn credssp_answers_every_failure_after_the_authenticate_alike(
+    #[case] wrapping: Wrapping,
+    #[case] username: &str,
+    #[case] password: &str,
+    #[case] alteration: Alteration,
+    #[case] reason: sspi::ErrorKind,
+) {
+    let Exchange::Refused { reply, error } = hand_driven_credssp(wrapping, username, password, alteration) else {
+        panic!("the logon should fail");
+    };
+
+    // oracle: spec MS-CSSP §2.2.1 and MS-ERREF §2.3.1: errorCode carries STATUS_LOGON_FAILURE for bad authentication information.
+    assert_eq!(reply, logon_failure_answer());
+    // oracle: mutant answering every failure alike and losing the server's reason with it.
+    assert_eq!(sspi_error_kind(&error), Some(reason));
+}
+
+/// The server's CHALLENGE carries MsvAvTimestamp, so an NTLMv2 client must send a MIC ([MS-NLMP] 3.1.5.1.2), and the
+/// MIC is what checks the password in the AUTHENTICATE. One without a MIC is refused even with the right password.
+#[rstest::rstest]
+fn credssp_refuses_an_authenticate_without_a_mic(
+    #[values(Wrapping::Bare, Wrapping::Spnego)] wrapping: Wrapping,
+    #[values(Alteration::AuthenticateWithoutMicFlag, Alteration::AuthenticateWithoutTargetInfo)] alteration: Alteration,
+) {
+    let exchange = hand_driven_credssp(wrapping, "alice", "secret", alteration);
+
+    // oracle: spec MS-NLMP §3.1.5.1.2 and §3.2.5.1.2: with MsvAvTimestamp in the CHALLENGE the client provides a MIC.
+    let Exchange::Refused { reply, error } = exchange else {
+        panic!("an AUTHENTICATE without a MIC should be refused");
+    };
+    assert_eq!(reply, logon_failure_answer());
+    assert_eq!(sspi_error_kind(&error), Some(sspi::ErrorKind::InvalidToken));
 }
 
 /// The server Demand Active carries `RDP` as its source descriptor, as the FreeRDP
