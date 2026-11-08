@@ -7,7 +7,7 @@ use ironrdp_core::{
 };
 use num_derive::FromPrimitive;
 use num_traits::FromPrimitive as _;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::utils;
 use crate::utils::CharacterSet;
@@ -200,10 +200,13 @@ impl<'de> Decode<'de> for ClientInfo {
         let raw_password = &password_field[..password_size - nt];
         // A password cookie is opaque binary data. The field holds a password only when its text encodes back to the
         // same bytes: a cookie can contain null code units, invalid text, or end with its own null terminator.
-        let (password, password_cookie) = match utils::decode_string(password_field, character_set, true) {
-            Ok(password) if is_encoded_text(raw_password, &password, character_set) => (password, None),
-            _ => (String::new(), Some(PasswordCookie(raw_password.to_vec()))),
-        };
+        let (password, password_cookie) =
+            match utils::decode_string(password_field, character_set, true).map(Zeroizing::new) {
+                Ok(mut password) if is_encoded_text(raw_password, &password, character_set) => {
+                    (core::mem::take(&mut *password), None)
+                }
+                _ => (String::new(), Some(PasswordCookie(raw_password.to_vec()))),
+            };
 
         let domain = if domain.is_empty() { None } else { Some(domain) };
         let credentials = Credentials {
@@ -231,7 +234,7 @@ impl<'de> Decode<'de> for ClientInfo {
 }
 
 /// Opaque password cookie, such as the one a Server Redirection PDU provides for the target server.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct PasswordCookie(pub Vec<u8>);
 
@@ -1139,7 +1142,9 @@ mod tests {
 
     use zeroize::Zeroize as _;
 
-    use super::{ClientAutoReconnect, Credentials, ExtendedClientOptionalInfo, PerformanceFlags, TimezoneInfo};
+    use super::{
+        ClientAutoReconnect, Credentials, ExtendedClientOptionalInfo, PasswordCookie, PerformanceFlags, TimezoneInfo,
+    };
 
     fn reconnect_cookie() -> [u8; 28] {
         let mut cookie = [0; 28];
@@ -1236,6 +1241,12 @@ mod tests {
     fn credentials_wipe_on_drop() {
         fn wiped<T: zeroize::ZeroizeOnDrop>() {}
         wiped::<Credentials>();
+    }
+
+    #[test]
+    fn password_cookie_wipes_on_drop() {
+        fn wiped<T: zeroize::ZeroizeOnDrop>() {}
+        wiped::<PasswordCookie>();
     }
 
     #[test]

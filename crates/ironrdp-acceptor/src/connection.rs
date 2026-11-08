@@ -1615,8 +1615,7 @@ impl Sequence for Acceptor {
                     "Received Client Info PDU"
                 );
                 self.received_auto_reconnect = auto_reconnect;
-                self.password_cookie
-                    .clone_from(&client_info.client_info.password_cookie);
+                self.password_cookie = client_info.client_info.password_cookie;
 
                 if !protocol.intersects(SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX) {
                     let creds = client_info.client_info.credentials;
