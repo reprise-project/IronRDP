@@ -8166,7 +8166,7 @@ mod tests {
 
             let reason = reason_pdu(error_info, 1003, 1002);
             assert_eq!(written, [reason.clone(), ultimatum_pdu().await].concat(), "{code:?}");
-            assert_eq!(decode_reason(&reason), error_info);
+            assert_eq!(decode_reason(&written[..reason.len()]), error_info);
             assert_eq!(code.as_u32(), value);
         }
     }
