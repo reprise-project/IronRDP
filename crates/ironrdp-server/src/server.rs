@@ -5867,7 +5867,7 @@ impl RdpServer {
                                 .contains(ironrdp_pdu::gcc::RedirectionFlags::REDIRECTED_SESSION_FIELD_VALID)
                         })
                         .map(|cluster| cluster.redirected_session_id),
-                    password_cookie: result.password_cookie.clone(),
+                    password_cookie: result.password_cookie,
                     client_info_flags: result.client_info_flags,
                     peer_addr: self.connection_peer_addr,
                 });
