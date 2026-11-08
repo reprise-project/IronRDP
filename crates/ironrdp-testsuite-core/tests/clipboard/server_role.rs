@@ -6,7 +6,9 @@
 
 use ironrdp_cliprdr::pdu::{ClipboardFormat, ClipboardFormatId, ClipboardPdu, FormatList, FormatListResponse};
 use ironrdp_cliprdr::{CliprdrServer, CliprdrState};
-use ironrdp_svc::SvcProcessor as _;
+use ironrdp_core::encode_vec;
+use ironrdp_pdu::rdp::vc::{ChannelControlFlags, ChannelPduHeader};
+use ironrdp_svc::{StaticVirtualChannel, SvcProcessor as _};
 
 use ironrdp_testsuite_core::clipboard::TestBackend;
 
@@ -50,7 +52,7 @@ fn server_transitions_to_ready_on_format_list() {
 
     // Client sends a FormatList
     let format_list = FormatList::new_unicode(&[ClipboardFormat::new(ClipboardFormatId::new(13))], true).unwrap();
-    let bytes = ironrdp_core::encode_vec(&ClipboardPdu::FormatList(format_list)).unwrap();
+    let bytes = encode_vec(&ClipboardPdu::FormatList(format_list)).unwrap();
     let response = server.process(&bytes).unwrap();
 
     // Server should now be Ready
@@ -73,4 +75,32 @@ fn server_rejects_operations_before_format_list() {
     // Attempting initiate_paste should fail because server is not in Ready state
     let result = server.initiate_paste(ClipboardFormatId::new(13));
     assert!(result.is_err(), "initiate_paste should fail in Initialization state");
+}
+
+#[test]
+fn a_clipboard_message_over_the_set_limit_fails_the_channel() {
+    let first_chunk = |length| {
+        let mut chunk = encode_vec(&ChannelPduHeader {
+            length,
+            flags: ChannelControlFlags::FLAG_FIRST,
+        })
+        .unwrap();
+        chunk.extend_from_slice(&[0; 8]);
+        chunk
+    };
+    let limited = || StaticVirtualChannel::new(CliprdrServer::new(Box::new(TestBackend)).with_max_message_size(1024));
+    let mut unlimited = StaticVirtualChannel::new(CliprdrServer::new(Box::new(TestBackend)));
+
+    assert!(
+        limited().process(&first_chunk(1024)).is_ok(),
+        "a message at the limit is taken"
+    );
+    assert!(
+        limited().process(&first_chunk(1025)).is_err(),
+        "one byte over the limit"
+    );
+    assert!(
+        unlimited.process(&first_chunk(64 << 20)).is_ok(),
+        "no limit without the setter"
+    );
 }
