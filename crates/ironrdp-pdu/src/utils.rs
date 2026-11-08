@@ -103,32 +103,32 @@ pub fn read_string_from_cursor(
         return Ok(String::new());
     }
 
-    let result = match character_set {
+    // The result is the only allocation, sized up front, so no freed buffer keeps a copy of the text.
+    match character_set {
         CharacterSet::Unicode => {
             ensure_size!(ctx: "Decode string (UTF-16)", in: cursor, size: size);
-            let mut slice = cursor.read_slice(size);
-
-            let str_buffer = &mut slice;
-            let mut u16_buffer = vec![0u16; str_buffer.len() / 2];
-
-            #[expect(clippy::missing_panics_doc, reason = "unreachable panic (prior constrain)")]
-            str_buffer
-                .read_u16_into::<LittleEndian>(u16_buffer.as_mut())
-                .expect("BUG: str_buffer is always even for UTF16");
-
-            String::from_utf16(&u16_buffer).map_err(
-                |_| invalid_field_err!("UTF16 decode", "buffer", "Failed to decode UTF16 string", in: cursor),
-            )?
+            let slice = cursor.read_slice(size);
+            let units = || slice.chunks_exact(2).map(|unit| u16::from_le_bytes([unit[0], unit[1]]));
+            let text_units = units().rposition(|unit| unit != 0).map_or(0, |last| last + 1);
+            let mut utf8_len = 0;
+            for decoded in char::decode_utf16(units().take(text_units)) {
+                let c = decoded.map_err(
+                    |_| invalid_field_err!("UTF16 decode", "buffer", "Failed to decode UTF16 string", in: cursor),
+                )?;
+                utf8_len += c.len_utf8();
+            }
+            let mut result = String::with_capacity(utf8_len);
+            result.extend(char::decode_utf16(units().take(text_units)).map_while(Result::ok));
+            Ok(result)
         }
         CharacterSet::Ansi => {
             ensure_size!(ctx: "Decode string (UTF-8)", in: cursor, size: size);
             let slice = cursor.read_slice(size);
-            String::from_utf8(slice.to_vec())
-                .map_err(|_| invalid_field_err!("UTF8 decode", "buffer", "Failed to decode UTF8 string", in: cursor))?
+            let text = core::str::from_utf8(slice)
+                .map_err(|_| invalid_field_err!("UTF8 decode", "buffer", "Failed to decode UTF8 string", in: cursor))?;
+            Ok(text.trim_end_matches('\0').to_owned())
         }
-    };
-
-    Ok(result.trim_end_matches('\0').into())
+    }
 }
 
 pub fn decode_string(src: &[u8], character_set: CharacterSet, read_null_terminator: bool) -> DecodeResult<String> {
