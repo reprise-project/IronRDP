@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use ironrdp_async::NetworkClient;
 use ironrdp_connector::sspi::credssp::{
     CredSspServer, CredentialsProxy, NStatusCode, ServerError, ServerMode, ServerState, TsRequest,
@@ -11,6 +13,7 @@ use ironrdp_connector::{
 };
 use ironrdp_core::{WriteBuf, other_err};
 use ironrdp_pdu::PduHint;
+use picky_krb::gss_api::NegTokenTarg1;
 use tracing::debug;
 
 /// Selects the authentication provider used inside CredSSP.
@@ -51,19 +54,89 @@ impl PduHint for CredsspTsRequestHint {
 /// Start of an NTLM message that is not wrapped in SPNEGO ([MS-NLMP] 2.2.1.1).
 const NTLM_SIGNATURE: &[u8] = b"NTLMSSP\0";
 
-/// NTSTATUS code sent to the client in `TsRequest.errorCode` when CredSSP fails ([MS-CSSP] 2.2.1).
+/// NTSTATUS code sent to the client in `TsRequest.errorCode` when CredSSP fails before the client's
+/// AUTHENTICATE ([MS-CSSP] 2.2.1).
 ///
 /// The sspi crate derives the code from the SSPI error, which is not an NTSTATUS value.
-/// A wrong password or an unknown user is reported as STATUS_LOGON_FAILURE, as Windows does,
-/// so that the client can ask for new credentials.
-/// The sspi crate signals them as `LogonDenied`, or as `NoCredentials` when SPNEGO finds no
-/// configured identity for the user.
+/// A logon refusal is reported as STATUS_LOGON_FAILURE, as Windows does, so that the client can ask for
+/// new credentials.
 /// Other errors keep the code from sspi.
 fn client_error_code(error: &sspi::Error) -> Option<NStatusCode> {
     match error.error_type {
         sspi::ErrorKind::LogonDenied | sspi::ErrorKind::NoCredentials => Some(NStatusCode::LOGON_FAILURE),
         _ => None,
     }
+}
+
+/// The answer to every failure once the client has sent its AUTHENTICATE: STATUS_LOGON_FAILURE and nothing
+/// else, so that it tells neither whether the account exists nor which check refused the logon.
+fn logon_failure() -> TsRequest {
+    TsRequest {
+        error_code: Some(NStatusCode::LOGON_FAILURE),
+        ..TsRequest::default()
+    }
+}
+
+/// The NTLM AUTHENTICATE message ([MS-NLMP] 2.2.1.3) in a client's negoToken, bare or as the responseToken of an
+/// SPNEGO NegTokenResp, parsed as sspi parses it.
+fn ntlm_authenticate(nego_token: &[u8]) -> Option<Cow<'_, [u8]>> {
+    let message = if nego_token.starts_with(NTLM_SIGNATURE) {
+        Cow::Borrowed(nego_token)
+    } else {
+        let response: NegTokenTarg1 = picky_asn1_der::from_bytes(nego_token).ok()?;
+        Cow::Owned(response.0.response_token.0?.0.0)
+    };
+    (message.starts_with(NTLM_SIGNATURE) && message.get(8..12) == Some(&[3, 0, 0, 0])).then_some(message)
+}
+
+/// Whether sspi checks a MIC in an AUTHENTICATE ([MS-NLMP] 2.2.1.3, 2.2.2.1).
+///
+/// sspi reads the MIC only when NTLMSSP_NEGOTIATE_TARGET_INFO is set, and checks it only when the first MsvAvFlags
+/// pair in the NTLMv2 response has its MIC bit.
+fn carries_mic(message: &[u8]) -> bool {
+    const NEGOTIATE_TARGET_INFO: u32 = 0x0080_0000;
+    const AV_FLAGS: u16 = 6;
+    const AV_FLAG_MIC: u32 = 0x2;
+    /// NTProofStr and the fixed fields of NTLMv2_CLIENT_CHALLENGE before its AvPairs ([MS-NLMP] 2.2.2.7, 2.2.2.8).
+    const AV_PAIRS_OFFSET: usize = 16 + 28;
+
+    fn u16_at(bytes: &[u8], at: usize) -> Option<u16> {
+        Some(u16::from_le_bytes(bytes.get(at..at.checked_add(2)?)?.try_into().ok()?))
+    }
+    fn u32_at(bytes: &[u8], at: usize) -> Option<u32> {
+        Some(u32::from_le_bytes(bytes.get(at..at.checked_add(4)?)?.try_into().ok()?))
+    }
+
+    let mic_flag = || -> Option<bool> {
+        if u32_at(message, 60)? & NEGOTIATE_TARGET_INFO == 0 {
+            return Some(false);
+        }
+        let length = usize::from(u16_at(message, 20)?);
+        let offset = usize::try_from(u32_at(message, 24)?).ok()?;
+        let response = message.get(offset..offset.checked_add(length)?)?;
+        let mut av_pairs = response.get(AV_PAIRS_OFFSET..)?;
+        while !av_pairs.is_empty() {
+            let id = u16_at(av_pairs, 0)?;
+            let length = usize::from(u16_at(av_pairs, 2)?);
+            let value = av_pairs.get(4..4 + length)?;
+            if id == AV_FLAGS {
+                return Some(value.len() == 4 && u32_at(value, 0)? & AV_FLAG_MIC != 0);
+            }
+            av_pairs = &av_pairs[4 + length..];
+        }
+        Some(false)
+    };
+    mic_flag().unwrap_or(false)
+}
+
+/// A generator that ends at once with `error`, for a request refused before sspi reads it.
+fn refused<'a>(error: sspi::Error) -> CredsspProcessGenerator<'a> {
+    Generator::new(move |_| async move {
+        Err(ServerError {
+            ts_request: None,
+            error,
+        })
+    })
 }
 
 pub type CredsspProcessGenerator<'a> =
@@ -76,6 +149,7 @@ pub struct CredsspSequence<'a> {
     /// Boxed so that the futures holding a `CredsspSequence` stay small.
     bare_ntlm_server: Option<Box<CredSspServer<CredentialsProxyImpl<'a>>>>,
     state: CredsspState,
+    authenticate_received: bool,
 }
 
 /// Where CredSSP finds the credentials it checks a client against.
@@ -289,6 +363,7 @@ impl<'a> CredsspSequence<'a> {
             server,
             bare_ntlm_server,
             state: CredsspState::Ongoing,
+            authenticate_received: false,
         };
 
         Ok(sequence)
@@ -302,21 +377,6 @@ impl<'a> CredsspSequence<'a> {
                     let message = TsRequest::from_buffer(input).map_err(|e| custom_err!("TsRequest", e))?;
 
                     debug!(?message, "Received");
-
-                    // sspi splits pubKeyAuth at the signature size without checking its length.
-                    if message
-                        .pub_key_auth
-                        .as_ref()
-                        .is_some_and(|proof| proof.len() < sspi::ntlm::SIGNATURE_SIZE)
-                    {
-                        return Err(ConnectorError::new(
-                            "CredSSP decode",
-                            ConnectorErrorKind::Credssp(sspi::Error::new(
-                                sspi::ErrorKind::InvalidToken,
-                                "pubKeyAuth is shorter than a message signature",
-                            )),
-                        ));
-                    }
 
                     Ok(Some(message))
                 };
@@ -353,6 +413,36 @@ impl<'a> CredsspSequence<'a> {
             self.server = *bare_ntlm_server;
         }
 
+        // Like sspi's own parsing, which runs inside the generator, a panic here must not end the process.
+        let authenticate = std::panic::catch_unwind(|| {
+            let authenticate = ntlm_authenticate(request.nego_tokens.as_deref()?)?;
+            Some(carries_mic(&authenticate))
+        })
+        .unwrap_or(Some(false));
+        if let Some(carries_mic) = authenticate {
+            self.authenticate_received = true;
+            // sspi's CHALLENGE carries MsvAvTimestamp, so every NTLMv2 client sends a MIC ([MS-NLMP] 3.1.5.1.2).
+            // sspi does not check NTProofStr, so without the MIC a wrong password would pass the AUTHENTICATE.
+            if !carries_mic {
+                return refused(sspi::Error::new(
+                    sspi::ErrorKind::InvalidToken,
+                    "the NTLM AUTHENTICATE carries no MIC",
+                ));
+            }
+        }
+
+        // sspi splits pubKeyAuth at the signature size without checking its length.
+        if request
+            .pub_key_auth
+            .as_ref()
+            .is_some_and(|proof| proof.len() < sspi::ntlm::SIGNATURE_SIZE)
+        {
+            return refused(sspi::Error::new(
+                sspi::ErrorKind::InvalidToken,
+                "pubKeyAuth is shorter than a message signature",
+            ));
+        }
+
         self.server.process(request)
     }
 
@@ -365,13 +455,17 @@ impl<'a> CredsspSequence<'a> {
             Ok(ServerState::ReplyNeeded(ts_request)) => (Some(ts_request), CredsspState::Ongoing, None),
             Ok(ServerState::Finished(identity)) => (None, CredsspState::Finished(identity.clone()), Some(identity)),
             Err(err) => {
-                let ts_request = err.ts_request.map(|ts_request| {
-                    let mut ts_request = *ts_request;
-                    if let Some(code) = client_error_code(&err.error) {
-                        ts_request.error_code = Some(code);
-                    }
-                    ts_request
-                });
+                let ts_request = if self.authenticate_received {
+                    Some(logon_failure())
+                } else {
+                    err.ts_request.map(|ts_request| {
+                        let mut ts_request = *ts_request;
+                        if let Some(code) = client_error_code(&err.error) {
+                            ts_request.error_code = Some(code);
+                        }
+                        ts_request
+                    })
+                };
                 (ts_request, CredsspState::ServerError(err.error), None)
             }
         };
