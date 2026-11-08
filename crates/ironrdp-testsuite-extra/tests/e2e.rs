@@ -2776,6 +2776,76 @@ async fn connect_active_client(
     (active_stage, activation_factory, upgraded_framed)
 }
 
+/// A validator that counts its checks and refuses every one.
+struct CountingRefusal(Arc<AtomicUsize>);
+
+#[async_trait::async_trait]
+impl server::CredentialValidator for CountingRefusal {
+    async fn validate(
+        &self,
+        _: &server::Credentials,
+    ) -> Result<server::CredentialDecision, server::CredentialValidationError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(server::CredentialDecision::Reject)
+    }
+}
+
+/// A server that never issued a cookie can't match an auto-reconnect packet, so the packet
+/// must not defer the Client Info credential check to activation.
+#[tokio::test]
+async fn an_auto_reconnect_packet_to_a_server_without_a_cookie_has_its_credentials_checked() {
+    let cert_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs/server-cert.pem");
+    let key_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs/server-key.pem");
+    let identity = TlsIdentityCtx::init_from_paths(&cert_path, &key_path).expect("failed to init TLS identity");
+    let checks = Arc::new(AtomicUsize::new(0));
+    let (_display_tx, display_rx) = mpsc::unbounded_channel();
+    let mut server = RdpServer::builder()
+        .with_addr(([127, 0, 0, 1], 0))
+        .with_tls(identity.make_acceptor().expect("failed to build TLS acceptor"))
+        .with_input_handler(TestInputHandler)
+        .with_display_handler(TestDisplay {
+            rx: Arc::new(Mutex::new(display_rx)),
+            offers_display_control: false,
+        })
+        .with_credential_validator(Some(Arc::new(CountingRefusal(Arc::clone(&checks)))))
+        .build();
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind listener");
+    let server_addr = listener.local_addr().expect("listener address");
+
+    let local = tokio::task::LocalSet::new();
+    let connected = local
+        .run_until(async move {
+            let server = tokio::task::spawn_local(async move {
+                let (stream, _) = listener.accept().await.expect("accept connection");
+                let _ = Box::pin(server.run_connection(stream)).await;
+            });
+            let client = tokio::task::spawn_local(async move {
+                let cookie = ServerAutoReconnect {
+                    logon_id: 1,
+                    random_bits: [0x5a; 16],
+                };
+                let mut config = default_client_config();
+                config.enable_credssp = false;
+                connect_client_with(
+                    server_addr,
+                    |client_addr| {
+                        connector::ClientConnector::new(config, client_addr).with_auto_reconnect_cookie(cookie)
+                    },
+                    |stream| stream,
+                )
+                .await
+                .is_ok()
+            });
+            let (server, client) = tokio::join!(server, client);
+            server.expect("server task");
+            client.expect("client task")
+        })
+        .await;
+
+    assert!(!connected, "the refused login does not connect");
+    assert_eq!(checks.load(Ordering::SeqCst), 1, "the credentials were checked");
+}
+
 /// A server that holds an auto-reconnect cookie and whose cookies are issued on request or at
 /// activation, with the channel that feeds its display.
 fn auto_reconnect_server(on_request: bool) -> (RdpServer, UnboundedSender<DisplayUpdate>) {
