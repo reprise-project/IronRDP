@@ -882,6 +882,11 @@ impl Acceptor {
         matches!(self.state, AcceptorState::Credssp { .. })
     }
 
+    /// Whether the acceptor waits at Licensing, where a recorded accept ends.
+    pub fn is_licensing(&self) -> bool {
+        matches!(self.state, AcceptorState::LicensingExchange { .. })
+    }
+
     pub(crate) fn desktop_size(&self) -> DesktopSize {
         self.desktop_size
     }
@@ -961,7 +966,7 @@ impl Acceptor {
 
     /// Whether credentials need handling after channel joins and ClientInfo.
     pub(crate) fn credentials_need_handling(&self) -> bool {
-        matches!(self.state, AcceptorState::LicensingExchange { .. })
+        self.is_licensing()
             && !self.is_auto_reconnect_attempt()
             && self.received_credentials.is_some()
             && !self.credentials_handled
