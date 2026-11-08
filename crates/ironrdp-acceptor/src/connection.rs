@@ -602,10 +602,11 @@ impl Acceptor {
         self.honor_client_desktop_size = max;
     }
 
-    /// Whether a Client Auto-Reconnect Packet in Client Info is taken as an auto-reconnect
-    /// attempt, which defers the credential check to the server's cookie check. A server that
-    /// holds no cookie turns this off, so such a packet is ignored and the Client Info
-    /// credentials are checked as for any login. On by default.
+    /// Whether a Client Auto-Reconnect Packet in Client Info is taken as an auto-reconnect attempt, which defers the
+    /// credential check to the server's cookie check.
+    /// A server that holds no cookie turns this off, so such a packet is ignored and the Client Info credentials are
+    /// checked as for any login.
+    /// On by default.
     pub fn set_accept_auto_reconnect(&mut self, accept: bool) {
         self.accept_auto_reconnect = accept;
     }
