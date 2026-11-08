@@ -2868,6 +2868,13 @@ impl RdpServer {
         )
     }
 
+    /// Whether a client's auto-reconnect packet can match a cookie; without one the acceptor
+    /// ignores the packet and checks the Client Info credentials.
+    fn holds_auto_reconnect_cookie(&self) -> bool {
+        self.supports_auto_reconnect()
+            && (self.auto_reconnect_cookie.is_some() || self.previous_auto_reconnect_cookie.is_some())
+    }
+
     fn verify_auto_reconnect_cookie(&self, reconnect: &rdp::client_info::ClientAutoReconnect) -> bool {
         if !self.supports_auto_reconnect() {
             return false;
@@ -3543,6 +3550,7 @@ impl RdpServer {
         let (size, capabilities) = self.begin_connection().await;
         let mut acceptor = Acceptor::new(resumed.security, size, capabilities, self.creds.clone());
         acceptor.set_honor_client_desktop_size(self.opts.honor_client_desktop_size);
+        acceptor.set_accept_auto_reconnect(self.holds_auto_reconnect_cookie());
         // Before the replay: Basic Settings gives channel IDs only to the static channels attached by then.
         let channels = self.attach_channels(&mut acceptor).await;
 
@@ -6496,6 +6504,7 @@ impl RdpServer {
     where
         S: AsyncRead + AsyncWrite + Sync + Send + Unpin,
     {
+        acceptor.set_accept_auto_reconnect(self.holds_auto_reconnect_cookie());
         let mut conn = match channels {
             Some(conn) => conn,
             None => self.attach_channels(&mut acceptor).await,

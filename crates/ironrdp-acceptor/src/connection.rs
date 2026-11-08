@@ -184,6 +184,7 @@ pub struct Acceptor {
     received_credentials: Option<ReceivedCredentials>,
     credentials_handled: bool,
     received_auto_reconnect: Option<ClientAutoReconnect>,
+    accept_auto_reconnect: bool,
     allow_unverified_credentials: bool,
     reactivation: bool,
     honor_client_desktop_size: Option<DesktopSize>,
@@ -538,6 +539,7 @@ impl Acceptor {
             received_credentials: None,
             credentials_handled: false,
             received_auto_reconnect: None,
+            accept_auto_reconnect: true,
             allow_unverified_credentials: false,
             reactivation: false,
             honor_client_desktop_size: None,
@@ -598,6 +600,14 @@ impl Acceptor {
     /// [`RdpServerDisplay`]: <https://docs.rs/ironrdp-server/latest/ironrdp_server/trait.RdpServerDisplay.html>
     pub fn set_honor_client_desktop_size(&mut self, max: Option<DesktopSize>) {
         self.honor_client_desktop_size = max;
+    }
+
+    /// Whether a Client Auto-Reconnect Packet in Client Info is taken as an auto-reconnect
+    /// attempt, which defers the credential check to the server's cookie check. A server that
+    /// holds no cookie turns this off, so such a packet is ignored and the Client Info
+    /// credentials are checked as for any login. On by default.
+    pub fn set_accept_auto_reconnect(&mut self, accept: bool) {
+        self.accept_auto_reconnect = accept;
     }
 
     /// Selects the CredSSP authentication provider before negotiation begins.
@@ -812,6 +822,7 @@ impl Acceptor {
             received_credentials: consumed.received_credentials,
             credentials_handled: consumed.credentials_handled,
             received_auto_reconnect: consumed.received_auto_reconnect,
+            accept_auto_reconnect: consumed.accept_auto_reconnect,
             allow_unverified_credentials: consumed.allow_unverified_credentials,
             reactivation: true,
             honor_client_desktop_size: consumed.honor_client_desktop_size,
@@ -1617,9 +1628,10 @@ impl Sequence for Acceptor {
                     .cloned();
                 debug!(
                     has_auto_reconnect = auto_reconnect.is_some(),
+                    accept_auto_reconnect = self.accept_auto_reconnect,
                     "Received Client Info PDU"
                 );
-                self.received_auto_reconnect = auto_reconnect;
+                self.received_auto_reconnect = auto_reconnect.filter(|_| self.accept_auto_reconnect);
                 self.password_cookie = client_info.client_info.password_cookie;
 
                 if !protocol.intersects(SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX) {
