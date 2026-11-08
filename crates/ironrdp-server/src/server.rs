@@ -1069,6 +1069,10 @@ impl dvc::DvcProcessor for AInputHandler {
         ironrdp_ainput::CHANNEL_NAME
     }
 
+    fn max_message_size(&self) -> Option<usize> {
+        Some(4096)
+    }
+
     fn start(&mut self, _channel_id: u32) -> PduResult<Vec<dvc::DvcMessage>> {
         use ironrdp_ainput::{ServerPdu, VersionPdu};
 
@@ -8386,6 +8390,27 @@ mod tests {
         }
 
         assert_eq!(*requested.lock().unwrap(), [first, second]);
+    }
+
+    #[test]
+    fn every_channel_the_server_reads_reassembles_a_bounded_message() {
+        use ironrdp_dvc::DvcProcessor as _;
+        use ironrdp_svc::SvcProcessor as _;
+
+        let limits = [
+            ("drdynvc", dvc::DrdynvcServer::new().max_message_size()),
+            (
+                "ainput",
+                AInputHandler::new(Arc::new(AtomicBool::new(false))).max_message_size(),
+            ),
+            (
+                "displaycontrol",
+                DisplayControlServer::new(DisplayControlCapabilities::single_monitor()).max_message_size(),
+            ),
+        ];
+        for (channel, limit) in limits {
+            assert!(limit.is_some(), "{channel} has no reassembly limit");
+        }
     }
 
     // oracle: spec MS-RDPEDISP §2.2.2.1, MaxNumMonitors is the number of monitors the server supports.

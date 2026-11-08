@@ -2728,9 +2728,16 @@ impl GraphicsPipelineServer {
 
 impl_as_any!(GraphicsPipelineServer);
 
+/// The largest message reassembled from a client: a full cache import offer is under 64 KiB.
+const MAX_CLIENT_MESSAGE_SIZE: usize = 1024 * 1024;
+
 impl DvcProcessor for GraphicsPipelineServer {
     fn channel_name(&self) -> &str {
         CHANNEL_NAME
+    }
+
+    fn max_message_size(&self) -> Option<usize> {
+        Some(MAX_CLIENT_MESSAGE_SIZE)
     }
 
     fn start(&mut self, channel_id: u32) -> PduResult<Vec<DvcMessage>> {
