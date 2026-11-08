@@ -442,6 +442,9 @@ pub struct Cliprdr<R: Role> {
     /// [`MAX_PENDING_FORMAT_DATA_REQUESTS`] bounds one that doesn't.
     pending_format_data_requests: VecDeque<PendingFormatDataRequest>,
 
+    /// The largest message reassembled from the peer, or no limit; see [`Self::with_max_message_size`].
+    max_message_size: Option<usize>,
+
     /// Stores the local file list when initiating a file copy operation.
     /// Set by initiate_file_copy(), used to respond to FormatDataRequest.
     local_file_list: Option<PackedFileList>,
@@ -609,6 +612,7 @@ impl<R: Role> Cliprdr<R> {
             state: CliprdrState::Initialization,
             capabilities: Capabilities::new(ClipboardProtocolVersion::V2, flags),
             pending_format_data_requests: VecDeque::new(),
+            max_message_size: None,
             local_file_list: None,
             local_file_list_format_id: None,
             local_drop_effect_format_id: None,
@@ -626,6 +630,14 @@ impl<R: Role> Cliprdr<R> {
             transfer_timeout,
             _marker: core::marker::PhantomData,
         }
+    }
+
+    /// Bounds the messages reassembled from the peer to `limit` bytes; a longer one fails the channel.
+    /// Without it a peer can declare a message of up to 4 GiB and have it buffered as it arrives.
+    #[must_use]
+    pub fn with_max_message_size(mut self, limit: usize) -> Self {
+        self.max_message_size = Some(limit);
+        self
     }
 
     pub fn downcast_backend<T: CliprdrBackend>(&self) -> Option<&T> {
@@ -1658,6 +1670,10 @@ impl<R: Role> Cliprdr<R> {
 impl<R: Role> SvcProcessor for Cliprdr<R> {
     fn channel_name(&self) -> ChannelName {
         Self::CHANNEL_NAME
+    }
+
+    fn max_message_size(&self) -> Option<usize> {
+        self.max_message_size
     }
 
     fn start(&mut self) -> PduResult<Vec<SvcMessage>> {
