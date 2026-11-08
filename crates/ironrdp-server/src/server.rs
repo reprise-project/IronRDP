@@ -7991,7 +7991,7 @@ mod cliprdr_error_tests {
     }
 
     #[test]
-    fn the_clipboard_channel_takes_its_factorys_limit() {
+    fn the_clipboard_channel_takes_the_limit_its_factory_asks_for() {
         use ironrdp_svc::SvcProcessor as _;
 
         assert_eq!(
