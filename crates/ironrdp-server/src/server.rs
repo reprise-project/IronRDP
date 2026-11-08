@@ -3,7 +3,7 @@ use core::fmt;
 use core::net::{IpAddr, SocketAddr};
 #[cfg(feature = "egfx")]
 use core::num::NonZeroU32;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
 #[cfg(feature = "usb")]
 use std::collections::HashMap;
@@ -1044,50 +1044,18 @@ impl RdpServerSecurity {
 }
 
 struct AInputHandler {
-    handler: Arc<Mutex<Box<dyn RdpServerInputHandler>>>,
-    /// Events that found the handler locked, handed over in order by one task.
-    backlog: mpsc::UnboundedSender<MouseEvent>,
-    /// Events in `backlog` not yet handed over; while any are, later ones queue behind them.
-    waiting: Arc<AtomicUsize>,
+    handler: Arc<StdMutex<Box<dyn RdpServerInputHandler>>>,
     active: Arc<AtomicBool>,
 }
 
 impl_as_any!(AInputHandler);
 
 impl AInputHandler {
-    /// Hands the channel's mouse events to `handler` as they are read, between the fast-path and
-    /// slow-path input around them, so Shift+click stays a Shift+click. An event that finds the
-    /// handler locked goes to a task that keeps the channel's own order.
-    fn new(handler: Arc<Mutex<Box<dyn RdpServerInputHandler>>>, active: Arc<AtomicBool>) -> Self {
-        let (backlog, mut rx) = mpsc::unbounded_channel::<MouseEvent>();
-        let waiting = Arc::new(AtomicUsize::new(0));
-        task::spawn({
-            let handler = Arc::clone(&handler);
-            let waiting = Arc::clone(&waiting);
-            async move {
-                while let Some(event) = rx.recv().await {
-                    handler.lock().await.mouse(event);
-                    waiting.fetch_sub(1, Ordering::AcqRel);
-                }
-            }
-        });
-        Self {
-            handler,
-            backlog,
-            waiting,
-            active,
-        }
-    }
-
-    fn deliver(&self, event: MouseEvent) {
-        if self.waiting.load(Ordering::Acquire) == 0
-            && let Ok(mut handler) = self.handler.try_lock()
-        {
-            handler.mouse(event);
-            return;
-        }
-        self.waiting.fetch_add(1, Ordering::AcqRel);
-        let _ = self.backlog.send(event);
+    /// Hands the channel's mouse events to `handler` as they are read, under the lock the fast-path and slow-path
+    /// input take.
+    /// A click thus stays between the keys sent around it, and Shift+click stays a Shift+click.
+    fn new(handler: Arc<StdMutex<Box<dyn RdpServerInputHandler>>>, active: Arc<AtomicBool>) -> Self {
+        Self { handler, active }
     }
 }
 
@@ -1118,7 +1086,10 @@ impl dvc::DvcProcessor for AInputHandler {
         match decode(payload).map_err(|e| decode_err!(e))? {
             ClientPdu::Mouse(pdu) => {
                 self.active.store(true, Ordering::Release);
-                self.deliver(pdu.into());
+                self.handler
+                    .lock()
+                    .expect("input handler lock poisoned")
+                    .mouse(pdu.into());
             }
         }
 
@@ -1462,7 +1433,7 @@ pub struct RdpServer {
     pending_session_server_id: Arc<()>,
     opts: RdpServerOptions,
     // FIXME: replace with a channel and poll/process the handler?
-    handler: Arc<Mutex<Box<dyn RdpServerInputHandler>>>,
+    handler: Arc<StdMutex<Box<dyn RdpServerInputHandler>>>,
     display: Arc<Mutex<Box<dyn RdpServerDisplay>>>,
     static_channel_factories: Vec<Box<dyn StaticChannelFactory>>,
     dynamic_channel_factories: Vec<Box<dyn DynamicChannelFactory>>,
@@ -2720,7 +2691,7 @@ impl RdpServer {
         Self {
             pending_session_server_id: Arc::new(()),
             opts,
-            handler: Arc::new(Mutex::new(Box::new(BoundInputSlot::new(
+            handler: Arc::new(StdMutex::new(Box::new(BoundInputSlot::new(
                 handler,
                 Arc::clone(&bound_handler),
             )))),
@@ -6225,7 +6196,7 @@ impl RdpServer {
 
     async fn handle_fastpath(&mut self, input: FastPathInput) {
         for event in input.input_events().iter().copied() {
-            let mut handler = self.handler.lock().await;
+            let mut handler = self.handler.lock().expect("input handler lock poisoned");
             match event {
                 FastPathInputEvent::KeyboardEvent(flags, key) => {
                     handler.keyboard((key, flags).into());
@@ -6496,7 +6467,7 @@ impl RdpServer {
 
     async fn handle_input_event(&mut self, input: InputEventPdu) {
         for event in input.0 {
-            let mut handler = self.handler.lock().await;
+            let mut handler = self.handler.lock().expect("input handler lock poisoned");
             match event {
                 ironrdp_pdu::input::InputEvent::ScanCode(key) => {
                     handler.keyboard((key.key_code, key.flags).into());
@@ -8352,7 +8323,7 @@ mod tests {
         use ironrdp_ainput::{ClientPdu, MouseEventFlags, MousePdu};
 
         let active = Arc::new(AtomicBool::new(false));
-        let mut handler = AInputHandler::new(Arc::new(Mutex::new(Box::new(NoopInput))), Arc::clone(&active));
+        let mut handler = AInputHandler::new(Arc::new(StdMutex::new(Box::new(NoopInput))), Arc::clone(&active));
 
         handler.start(1).expect("AInput start failed");
         assert!(!active.load(Ordering::Acquire));
@@ -8388,7 +8359,7 @@ mod tests {
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut handler = AInputHandler::new(
-            Arc::new(Mutex::new(Box::new(RecordedInput(tx)))),
+            Arc::new(StdMutex::new(Box::new(RecordedInput(tx)))),
             Arc::new(AtomicBool::new(false)),
         );
         handler.start(1).expect("AInput start failed");
@@ -8456,7 +8427,7 @@ mod tests {
         use ironrdp_ainput::{ClientPdu, MouseEventFlags, MousePdu};
 
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let input: Arc<Mutex<Box<dyn RdpServerInputHandler>>> = Arc::new(Mutex::new(Box::new(HeardInput(tx))));
+        let input: Arc<StdMutex<Box<dyn RdpServerInputHandler>>> = Arc::new(StdMutex::new(Box::new(HeardInput(tx))));
         let mut ainput = AInputHandler::new(Arc::clone(&input), Arc::new(AtomicBool::new(false)));
         ainput.start(1).expect("AInput start failed");
         let pdu = ClientPdu::Mouse(MousePdu {
@@ -8474,9 +8445,9 @@ mod tests {
             extended1: false,
         };
 
-        input.lock().await.keyboard(key(0x2A));
+        input.lock().expect("input handler lock poisoned").keyboard(key(0x2A));
         ainput.process(1, &click).expect("AInput processing failed");
-        input.lock().await.keyboard(key(0x1E));
+        input.lock().expect("input handler lock poisoned").keyboard(key(0x1E));
 
         let mut heard = Vec::new();
         while heard.len() < 3 {
@@ -8492,7 +8463,7 @@ mod tests {
         use ironrdp_svc::SvcProcessor as _;
 
         let display: Arc<Mutex<Box<dyn RdpServerDisplay>>> = Arc::new(Mutex::new(Box::new(PendingDisplay)));
-        let input: Arc<Mutex<Box<dyn RdpServerInputHandler>>> = Arc::new(Mutex::new(Box::new(NoopInput)));
+        let input: Arc<StdMutex<Box<dyn RdpServerInputHandler>>> = Arc::new(StdMutex::new(Box::new(NoopInput)));
         let limits = [
             ("drdynvc", dvc::DrdynvcServer::new().max_message_size()),
             (
