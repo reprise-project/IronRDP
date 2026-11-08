@@ -2035,6 +2035,78 @@ async fn credssp_failed_logon_is_reported_as_logon_failure(
     assert_eq!(ts_request.error_code, Some(NStatusCode::LOGON_FAILURE));
 }
 
+/// Runs one client message through the server's CredSSP sequence, outside the panic guard
+/// of `accept_credssp_with`.
+fn credssp_server_step(
+    server: &mut ironrdp_acceptor::credssp::CredsspSequence<'_>,
+    message: &[u8],
+) -> ConnectorResult<Vec<u8>> {
+    let Some(request) = server.decode_client_message(message)? else {
+        return Ok(Vec::new());
+    };
+    let result = {
+        let mut generator = server.process_ts_request(request);
+        let GeneratorState::Completed(result) = generator.start() else {
+            panic!("NTLM should not make network requests");
+        };
+        result
+    };
+    let mut buf = WriteBuf::new();
+    server.handle_process_result(result, &mut buf)?;
+    Ok(buf.filled().to_vec())
+}
+
+/// A client's pubKeyAuth shorter than an NTLM signature (16 bytes) ends CredSSP with an error.
+#[rstest::rstest]
+#[case(0)]
+#[case(8)]
+#[case(15)]
+fn credssp_refuses_a_public_key_proof_shorter_than_a_signature(#[case] length: usize) {
+    let public_key = vec![0x42; 32];
+    let identity = AuthIdentity {
+        username: Username::new("alice", None).unwrap(),
+        password: "secret".to_owned().into(),
+    };
+    let mut server = ironrdp_acceptor::credssp::CredsspSequence::init(
+        &identity,
+        "client.example.com".to_owned().into(),
+        public_key.clone(),
+        None,
+    )
+    .unwrap();
+    let (mut client, request) = CredsspSequence::init(
+        ironrdp_connector::Credentials::UsernamePassword {
+            username: "alice".to_owned(),
+            password: "secret".to_owned(),
+        },
+        None,
+        SecurityProtocol::HYBRID,
+        "server.example.com".to_owned().into(),
+        public_key,
+        None,
+    )
+    .unwrap();
+
+    let mut message = client_credssp_message(&mut client, request);
+    loop {
+        let mut request = TsRequest::from_buffer(&message).unwrap();
+        if let Some(proof) = request.pub_key_auth.as_mut() {
+            proof.truncate(length);
+            message.clear();
+            request.encode_ts_request(&mut message).unwrap();
+            break;
+        }
+        let reply = credssp_server_step(&mut server, &message).unwrap();
+        let request = client.decode_server_message(&reply).unwrap().unwrap();
+        message = client_credssp_message(&mut client, request);
+    }
+
+    assert!(
+        credssp_server_step(&mut server, &message).is_err(),
+        "a {length}-byte pubKeyAuth should end CredSSP with an error"
+    );
+}
+
 /// The server Demand Active carries `RDP` as its source descriptor, as the FreeRDP
 /// server does; some clients (Jump Desktop) refuse an empty one.
 #[test]

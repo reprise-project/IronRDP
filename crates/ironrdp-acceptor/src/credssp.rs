@@ -302,6 +302,22 @@ impl<'a> CredsspSequence<'a> {
                     let message = TsRequest::from_buffer(input).map_err(|e| custom_err!("TsRequest", e))?;
 
                     debug!(?message, "Received");
+
+                    // sspi splits pubKeyAuth at the signature size without checking its length.
+                    if message
+                        .pub_key_auth
+                        .as_ref()
+                        .is_some_and(|proof| proof.len() < sspi::ntlm::SIGNATURE_SIZE)
+                    {
+                        return Err(ConnectorError::new(
+                            "CredSSP decode",
+                            ConnectorErrorKind::Credssp(sspi::Error::new(
+                                sspi::ErrorKind::InvalidToken,
+                                "pubKeyAuth is shorter than a message signature",
+                            )),
+                        ));
+                    }
+
                     Ok(Some(message))
                 };
 
