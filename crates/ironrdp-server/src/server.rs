@@ -13,8 +13,8 @@ use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::Instant;
 
 use ironrdp_acceptor::{
-    Acceptor, AcceptorResult, AcceptorState, BeginResult, ConnectionSetupHandler, ConnectorError,
-    ConnectorErrorExt as _, CredentialOrigin, CredsspBackend, DesktopSize, ReceivedCredentials, ReplayStep,
+    Acceptor, AcceptorResult, BeginResult, ConnectionSetupHandler, ConnectorError, ConnectorErrorExt as _,
+    CredentialOrigin, CredsspBackend, DesktopSize, ReceivedCredentials, ReplayStep,
 };
 use ironrdp_async::Framed;
 use ironrdp_cliprdr::CliprdrServer;
@@ -3929,11 +3929,7 @@ impl RdpServer {
     where
         S: AsyncRead + AsyncWrite + Send + Sync + Unpin,
     {
-        self.clear_bound_connection();
-        self.discard_stale_session_events().await;
-
-        let size = self.display.lock().await.size().await;
-        let capabilities = capabilities::capabilities(&self.opts, size);
+        let (size, capabilities) = self.begin_connection().await;
         let mut acceptor = Acceptor::new(resumed.security, size, capabilities, self.creds.clone());
         acceptor.set_honor_client_desktop_size(self.opts.honor_client_desktop_size);
         // Before the replay: Basic Settings gives channel IDs only to the static channels attached by then.
@@ -3942,10 +3938,7 @@ impl RdpServer {
         acceptor
             .replay(&resumed.steps)
             .map_err_kind("replay", ServerErrorKind::Connector)?;
-        if !matches!(
-            acceptor.state().as_any().downcast_ref(),
-            Some(AcceptorState::LicensingExchange { .. })
-        ) {
+        if !acceptor.is_licensing() {
             return Err(ServerError::reason(
                 "replay",
                 format!(
@@ -4026,7 +4019,8 @@ impl RdpServer {
         self.finalize_negotiated(negotiated).await
     }
 
-    async fn prepare_pending_connection(&mut self) -> PendingConnection {
+    /// Clears the previous connection and returns the desktop size and capabilities a new acceptor starts with.
+    async fn begin_connection(&mut self) -> (DesktopSize, Vec<CapabilitySet>) {
         self.clear_bound_connection();
 
         // Before negotiation, so nothing the previous session left queued can
@@ -4035,7 +4029,11 @@ impl RdpServer {
         self.discard_stale_session_events().await;
 
         let size = self.display.lock().await.size().await;
-        let capabilities = capabilities::capabilities(&self.opts, size);
+        (size, capabilities::capabilities(&self.opts, size))
+    }
+
+    async fn prepare_pending_connection(&mut self) -> PendingConnection {
+        let (size, capabilities) = self.begin_connection().await;
         let mut pending = PendingConnection::new(
             self.opts.security.clone(),
             size,
