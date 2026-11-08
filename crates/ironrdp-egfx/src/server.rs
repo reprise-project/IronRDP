@@ -2789,7 +2789,7 @@ impl DvcProcessor for GraphicsPipelineServer {
                 self.handle_cache_import_offer(pdu);
             }
             _ => {
-                warn!(?pdu, "Unhandled client GFX PDU");
+                debug!(?pdu, "Unhandled client GFX PDU");
             }
         }
 

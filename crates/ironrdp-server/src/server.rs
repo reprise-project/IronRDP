@@ -6258,7 +6258,7 @@ impl RdpServer {
                 }
 
                 FastPathInputEvent::QoeEvent(quality) => {
-                    warn!("Received QoE: {}", quality);
+                    debug!("Received QoE: {}", quality);
                 }
             }
         }
