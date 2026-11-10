@@ -214,6 +214,10 @@ pub enum PostConnectionAction {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ConnectionInfo {
+    /// See [`ironrdp_acceptor::AcceptorResult::client_version`].
+    pub client_version: ironrdp_pdu::gcc::RdpVersion,
+    /// See [`ironrdp_acceptor::AcceptorResult::client_build`].
+    pub client_build: u32,
     /// See [`ironrdp_acceptor::AcceptorResult::keyboard_layout`].
     pub keyboard_layout: u32,
     /// See [`ironrdp_acceptor::AcceptorResult::keyboard_type`].
@@ -272,6 +276,8 @@ impl ConnectionInfo {
     /// result, e.g. `info.desktop_scale_factor = Some(200);` to exercise a 2x client.
     pub fn new(keyboard_layout: u32, keyboard_type: ironrdp_pdu::gcc::KeyboardType, ime_file_name: String) -> Self {
         Self {
+            client_version: ironrdp_pdu::gcc::RdpVersion(0),
+            client_build: 0,
             keyboard_layout,
             keyboard_type,
             keyboard_subtype: 0,
@@ -5882,6 +5888,8 @@ impl RdpServer {
         if !result.reactivation {
             with_connection_handler(self.connection_handler.as_ref(), |h| {
                 h.on_connection_info(&ConnectionInfo {
+                    client_version: result.client_version,
+                    client_build: result.client_build,
                     keyboard_layout: result.keyboard_layout,
                     keyboard_type: result.keyboard_type,
                     keyboard_subtype: result.keyboard_subtype,
