@@ -1322,6 +1322,29 @@ fn scale_factors_survive_reactivation() {
     );
 }
 
+/// The client's `version` and `clientBuild` from its GCC Client Core Data (MS-RDPBCGR 2.2.1.3.2) reach the result,
+/// and a Deactivation-Reactivation, which doesn't resend that block, hands them back unchanged.
+#[test]
+fn client_version_and_build_are_kept_as_sent() {
+    let mut client_blocks = CLIENT_GCC_WITHOUT_OPTIONAL_FIELDS.clone();
+    client_blocks.core.version = ironrdp_pdu::gcc::RdpVersion::V10_12;
+    client_blocks.core.client_build = 26100;
+    let (acceptor, result, user_channel_id, io_channel_id) = accepted(client_blocks, &CLIENT_INFO_PDU_BUFFER);
+    assert_eq!(
+        (result.client_version, result.client_build),
+        (ironrdp_pdu::gcc::RdpVersion::V10_12, 26100)
+    );
+
+    let mut acceptor = Acceptor::new_deactivation_reactivation(acceptor, result.static_channels, DESKTOP_SIZE)
+        .expect("rebuild the acceptor for reactivation");
+    let result = result_after_activation(&mut acceptor, user_channel_id, io_channel_id);
+    assert!(result.reactivation);
+    assert_eq!(
+        (result.client_version, result.client_build),
+        (ironrdp_pdu::gcc::RdpVersion::V10_12, 26100)
+    );
+}
+
 #[derive(Default)]
 struct HandshakeStream {
     incoming: VecDeque<Vec<u8>>,

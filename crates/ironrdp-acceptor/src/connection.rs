@@ -152,6 +152,8 @@ pub struct Acceptor {
     user_channel_id: u16,
     message_channel_id: Option<u16>,
     desktop_size: DesktopSize,
+    client_version: gcc::RdpVersion,
+    client_build: u32,
     keyboard_layout: u32,
     keyboard_type: gcc::KeyboardType,
     keyboard_subtype: u32,
@@ -363,6 +365,10 @@ pub struct AcceptorResult {
     /// channel. `None` when the client did not request it.
     pub message_channel_id: Option<u16>,
     pub reactivation: bool,
+    /// RDP protocol version announced by the client in its GCC Client Core Data (section 2.2.1.3.2, `version`).
+    pub client_version: gcc::RdpVersion,
+    /// Build number announced by the client in its GCC Client Core Data (section 2.2.1.3.2, `clientBuild`).
+    pub client_build: u32,
     /// Keyboard layout identifier (KLID) announced by the client in its GCC
     /// Client Core Data (section 2.2.1.3.2, `keyboardLayout`).
     ///
@@ -512,6 +518,8 @@ impl Acceptor {
             io_channel_id: IO_CHANNEL_ID,
             message_channel_id: None,
             desktop_size,
+            client_version: gcc::RdpVersion(0),
+            client_build: 0,
             keyboard_layout: 0,
             keyboard_type: gcc::KeyboardType(0),
             keyboard_subtype: 0,
@@ -796,6 +804,8 @@ impl Acceptor {
             io_channel_id: consumed.io_channel_id,
             message_channel_id: consumed.message_channel_id,
             desktop_size,
+            client_version: consumed.client_version,
+            client_build: consumed.client_build,
             keyboard_layout: consumed.keyboard_layout,
             keyboard_type: consumed.keyboard_type,
             keyboard_subtype: consumed.keyboard_subtype,
@@ -1083,6 +1093,8 @@ impl Acceptor {
                 user_channel_id: self.user_channel_id,
                 io_channel_id: self.io_channel_id,
                 message_channel_id: self.message_channel_id,
+                client_version: self.client_version,
+                client_build: self.client_build,
                 keyboard_layout: self.keyboard_layout,
                 keyboard_type: self.keyboard_type,
                 keyboard_subtype: self.keyboard_subtype,
@@ -1415,6 +1427,8 @@ impl Sequence for Acceptor {
                     .monitor_extended
                     .map_or_else(Vec::new, |data| data.extended_monitors_info);
                 self.client_cluster_data.clone_from(&gcc_blocks.cluster);
+                self.client_version = gcc_blocks.core.version;
+                self.client_build = gcc_blocks.core.client_build;
                 self.keyboard_layout = gcc_blocks.core.keyboard_layout;
                 self.keyboard_type = gcc_blocks.core.keyboard_type;
                 self.keyboard_subtype = gcc_blocks.core.keyboard_subtype;
