@@ -24,6 +24,11 @@ name = "integration_tests_core"
 path = "tests/main.rs"
 harness = true
 
+[[test]]
+name = "decode_string_alloc"
+path = "tests/decode_string_alloc.rs"
+harness = true
+
 [dependencies]
 array-concat = "0.5"
 expect-test = "1"
@@ -43,7 +48,8 @@ expect-test.workspace = true
 hex = "0.4"
 ironrdp-cliprdr-format.path = "../ironrdp-cliprdr-format"
 ironrdp-cliprdr = { path = "../ironrdp-cliprdr", features = ["__test"] }
-ironrdp-acceptor.path = "../ironrdp-acceptor"
+ironrdp-acceptor = { path = "../ironrdp-acceptor", features = ["__test"] }
+ironrdp-ainput.path = "../ironrdp-ainput"
 ironrdp-async.path = "../ironrdp-async"
 ironrdp-tokio.path = "../ironrdp-tokio"
 ironrdp-bulk.path = "../ironrdp-bulk"

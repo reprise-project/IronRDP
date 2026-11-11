@@ -14,11 +14,12 @@ use std::time::Instant;
 
 use ironrdp_acceptor::{
     Acceptor, AcceptorResult, BeginResult, ConnectionSetupHandler, ConnectorError, ConnectorErrorExt as _,
-    CredentialOrigin, CredsspBackend, DesktopSize, ReceivedCredentials,
+    CredentialOrigin, CredsspBackend, DesktopSize, ReceivedCredentials, ReplayStep,
 };
 use ironrdp_async::Framed;
 use ironrdp_cliprdr::CliprdrServer;
 use ironrdp_cliprdr::backend::ClipboardMessage;
+use ironrdp_connector::Sequence as _;
 use ironrdp_core::{Encode as _, WriteBuf, decode, encode_vec, impl_as_any};
 use ironrdp_displaycontrol::pdu::{DisplayControlCapabilities, DisplayControlMonitorLayout};
 use ironrdp_displaycontrol::server::DisplayControlServer;
@@ -213,6 +214,10 @@ pub enum PostConnectionAction {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ConnectionInfo {
+    /// See [`ironrdp_acceptor::AcceptorResult::client_version`].
+    pub client_version: ironrdp_pdu::gcc::RdpVersion,
+    /// See [`ironrdp_acceptor::AcceptorResult::client_build`].
+    pub client_build: u32,
     /// See [`ironrdp_acceptor::AcceptorResult::keyboard_layout`].
     pub keyboard_layout: u32,
     /// See [`ironrdp_acceptor::AcceptorResult::keyboard_type`].
@@ -234,9 +239,12 @@ pub struct ConnectionInfo {
     pub auto_reconnect: bool,
     /// See [`ironrdp_acceptor::AcceptorResult::client_monitors`]. Taken from the
     /// GCC Client Monitor Data (MS-RDPBCGR 2.2.1.3.6), not Client Core Data, and
-    /// empty when the client sent none. It doesn't change the Monitor Layout PDU
-    /// the acceptor sends, which still describes one monitor.
+    /// empty when the client sent none.
     pub client_monitors: Vec<ironrdp_pdu::gcc::Monitor>,
+    /// See [`ironrdp_acceptor::AcceptorResult::client_monitors_ex`]. Taken from
+    /// GCC Client Monitor Extended Data (MS-RDPBCGR 2.2.1.3.9), empty when the
+    /// client sent none.
+    pub client_monitors_ex: Vec<ironrdp_pdu::gcc::ExtendedMonitorInfo>,
     /// See [`ironrdp_acceptor::AcceptorResult::routing_token`].
     pub routing_token: Option<String>,
     /// The session the client asked to reconnect to in its GCC Client Cluster Data (MS-RDPBCGR 2.2.1.3.5), as a
@@ -268,6 +276,8 @@ impl ConnectionInfo {
     /// result, e.g. `info.desktop_scale_factor = Some(200);` to exercise a 2x client.
     pub fn new(keyboard_layout: u32, keyboard_type: ironrdp_pdu::gcc::KeyboardType, ime_file_name: String) -> Self {
         Self {
+            client_version: ironrdp_pdu::gcc::RdpVersion(0),
+            client_build: 0,
             keyboard_layout,
             keyboard_type,
             keyboard_subtype: 0,
@@ -278,6 +288,7 @@ impl ConnectionInfo {
             performance_flags: rdp::client_info::PerformanceFlags::empty(),
             auto_reconnect: false,
             client_monitors: Vec::new(),
+            client_monitors_ex: Vec::new(),
             routing_token: None,
             redirected_session_id: None,
             password_cookie: None,
@@ -337,6 +348,7 @@ pub trait ConnectionHandler: Send {
     /// By default, it is the display handler's initial size.
     /// With [`RdpServerBuilder::with_honor_client_desktop_size`] enabled, a valid client request from
     /// Client Core Data is adopted after clamping to the configured maximum.
+    /// [`Self::choose_desktop_size`] may then pick another size.
     /// Return an error to stop connection setup.
     /// A callback error closes the transport without sending an access-denied PDU.
     ///
@@ -359,6 +371,24 @@ pub trait ConnectionHandler: Send {
         _desktop_size: DesktopSize,
     ) -> ServerResult<()> {
         Ok(())
+    }
+
+    /// Picks the desktop size the acceptor offers in capability exchange, from the client's monitors.
+    ///
+    /// Called once per connection, after [`Self::on_client_session_config`] and before capability exchange.
+    /// `client_monitors` holds the client's [Client Monitor Data (TS_UD_CS_MONITOR), section 2.2.1.3.6], empty when
+    /// it sent none, and `desktop_size` is the size the acceptor would offer; returning it keeps that size.
+    /// The Monitor Layout PDU lists `client_monitors` only when their bounding box spans the returned size.
+    /// The display handler's [`RdpServerDisplay::request_initial_size`] then receives the size the client confirms.
+    ///
+    /// [Client Monitor Data (TS_UD_CS_MONITOR), section 2.2.1.3.6]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/a8029f8e-01e1-4f19-af67-bcad5bdef624
+    fn choose_desktop_size(
+        &mut self,
+        client_monitors: &[ironrdp_pdu::gcc::Monitor],
+        desktop_size: DesktopSize,
+    ) -> DesktopSize {
+        let _ = client_monitors;
+        desktop_size
     }
 
     /// Called once per connection, after credential and auto-reconnect
@@ -1019,6 +1049,15 @@ impl RdpServerSecurity {
     }
 }
 
+/// The clipboard channel `factory` builds, bounded as it asks.
+fn cliprdr_channel(factory: &dyn CliprdrServerFactory) -> CliprdrServer {
+    let cliprdr = CliprdrServer::new(factory.build_cliprdr_backend());
+    match factory.max_message_size() {
+        Some(limit) => cliprdr.with_max_message_size(limit),
+        None => cliprdr,
+    }
+}
+
 struct AInputHandler {
     active: Arc<AtomicBool>,
     /// Mouse events received since the connection last took them.
@@ -1043,6 +1082,10 @@ impl_as_any!(AInputHandler);
 impl dvc::DvcProcessor for AInputHandler {
     fn channel_name(&self) -> &str {
         ironrdp_ainput::CHANNEL_NAME
+    }
+
+    fn max_message_size(&self) -> Option<usize> {
+        Some(4096)
     }
 
     fn start(&mut self, _channel_id: u32) -> PduResult<Vec<dvc::DvcMessage>> {
@@ -1514,11 +1557,8 @@ impl ErrorInfoDisconnectHandle {
     /// The disconnect takes effect only after the server handles this event.
     /// Unlike [`ServerEvent::Quit`], the client is told why: it decodes the
     /// PDU and can surface `error` to the user before the connection drops.
-    ///
-    /// The one exception is a client that did not set
-    /// `RNS_UD_CS_SUPPORT_ERRINFO_PDU` in its Client Core Data: MS-RDPBCGR
-    /// 3.3.5.7.1 forbids sending it the PDU, so it is disconnected without
-    /// the reason.
+    /// Every client is sent the PDU, including one that left
+    /// `RNS_UD_CS_SUPPORT_ERRINFO_PDU` off, as FreeRDP 3 does by default.
     #[expect(
         clippy::result_large_err,
         reason = "SendError<ServerEvent> hands the whole event back on a closed channel; ServerEvent's size is \
@@ -1622,12 +1662,9 @@ pub enum ServerEvent {
     /// client that replaced it, and the two ping-pong indefinitely. Telling
     /// the loser WHY it was disconnected is what makes it stay away.
     ///
-    /// The PDU is only sent to a client that set
-    /// `RNS_UD_CS_SUPPORT_ERRINFO_PDU` in its Client Core Data (MS-RDPBCGR
-    /// 3.3.5.7.1 forbids it otherwise); one that did not is dropped without
-    /// the reason, and the anti-storm cooldown on [`RdpServer::run`] is then
-    /// the only thing standing between it and the ping-pong above. (mstsc and
-    /// FreeRDP both set the flag.)
+    /// The PDU goes to every client, whatever its
+    /// `RNS_UD_CS_SUPPORT_ERRINFO_PDU` flag says, and is followed by the
+    /// Disconnect Provider Ultimatum.
     ///
     /// A more general version of the same PDU/mechanism exists as
     /// [`Self::Disconnect`] (upstream, `ErrorInfoDisconnectHandle`) for an
@@ -2077,6 +2114,7 @@ impl PendingConnection {
                         acceptor,
                         local_addr: None,
                         authenticated_credentials: credentials_handler.authenticated_credentials,
+                        channels: None,
                     }))
                 }
                 // The stream is already past TLS (terminated at a lower
@@ -2090,6 +2128,7 @@ impl PendingConnection {
                         acceptor,
                         local_addr: None,
                         authenticated_credentials: credentials_handler.authenticated_credentials,
+                        channels: None,
                     }))
                 }
             },
@@ -2099,6 +2138,7 @@ impl PendingConnection {
                 acceptor,
                 local_addr: None,
                 authenticated_credentials: credentials_handler.authenticated_credentials,
+                channels: None,
             })),
         }
     }
@@ -2115,6 +2155,17 @@ struct NegotiatedConnection<S> {
     /// the server accepted itself; see [`RdpServer::set_connection_local_addr`].
     local_addr: Option<SocketAddr>,
     authenticated_credentials: Option<Credentials>,
+    /// Channel backends already attached to `acceptor`; `None` attaches them at finalization.
+    channels: Option<ConnectionState>,
+}
+
+/// A connection another process accepted up to Licensing, for [`RdpServer::run_connection_resumed`].
+#[derive(Debug, Clone)]
+pub struct Resumed {
+    /// The security protocols that process's acceptor offered.
+    pub security: nego::SecurityProtocol,
+    /// What that acceptor read and wrote, from the X.224 Connection Request through Client Info.
+    pub steps: Vec<ReplayStep>,
 }
 
 /// A negotiated TCP connection whose session has not started.
@@ -2178,10 +2229,6 @@ struct ConnectionState {
     /// Whether the client advertised `SUPPORT_HEART_BEAT_PDU` in its GCC
     /// Client Core Data.
     client_supports_heartbeat: bool,
-    /// Whether the client advertised `SUPPORT_ERR_INFO_PDU` in its GCC Client
-    /// Core Data. MS-RDPBCGR 3.3.5.7.1 forbids sending it a Server Set Error
-    /// Info PDU unless it did.
-    client_supports_errinfo: bool,
     /// Auto-detect state, present when the server has auto-detect enabled.
     ///
     /// Probes in flight, RTT samples and the session-lifetime lowest RTT all
@@ -2630,7 +2677,7 @@ impl ConnectionState {
                 FastPathInputEvent::MouseEventEx(mouse) => Some(ConnectionOutput::Mouse(mouse.into())),
                 FastPathInputEvent::MouseEventRel(mouse) => Some(ConnectionOutput::Mouse(mouse.into())),
                 FastPathInputEvent::QoeEvent(quality) => {
-                    warn!(quality, "Received QoE");
+                    trace!(quality, "Received QoE");
                     None
                 }
             })
@@ -3232,6 +3279,13 @@ impl RdpServer {
         )
     }
 
+    /// Whether a client's auto-reconnect packet can match a cookie; without one the acceptor
+    /// ignores the packet and checks the Client Info credentials.
+    fn holds_auto_reconnect_cookie(&self) -> bool {
+        self.supports_auto_reconnect()
+            && (self.auto_reconnect_cookie.is_some() || self.previous_auto_reconnect_cookie.is_some())
+    }
+
     fn verify_auto_reconnect_cookie(&self, reconnect: &rdp::client_info::ClientAutoReconnect) -> bool {
         if !self.supports_auto_reconnect() {
             return false;
@@ -3541,11 +3595,7 @@ impl RdpServer {
         let autodetect_handles = AutoDetectHandles::default();
 
         if let Some(cliprdr_factory) = self.cliprdr_factory.as_deref() {
-            let backend = cliprdr_factory.build_cliprdr_backend();
-
-            let cliprdr = CliprdrServer::new(backend);
-
-            acceptor.attach_static_channel(cliprdr);
+            acceptor.attach_static_channel(cliprdr_channel(cliprdr_factory));
         }
 
         if let Some(factory) = self.sound_factory.as_deref() {
@@ -3640,7 +3690,6 @@ impl RdpServer {
             graphics_write: Arc::new(Mutex::new(())),
             static_channels: StaticChannelSet::new(),
             client_supports_heartbeat: false,
-            client_supports_errinfo: false,
             autodetect: self.autodetect_enabled.then(AutoDetectManager::new),
             autodetect_handles,
             display_suppressed: Arc::new(AtomicBool::new(false)),
@@ -3879,6 +3928,59 @@ impl RdpServer {
         result
     }
 
+    /// Run a connection that another process accepted through Client Info and handed over past its TLS.
+    ///
+    /// The acceptor offers `resumed.security` and replays `resumed.steps`; its TLS is not this server's, so a server
+    /// built with [`RdpServerSecurity::None`] runs it. A reply that differs from the recording, or a recording that
+    /// stops anywhere but Licensing, is an error before anything is written to `stream`.
+    ///
+    /// The credential validator sees the Client Info credentials, or for CredSSP the user with an empty password,
+    /// at Licensing. The connection runs without UDP multitransport, and under `RdpServerSecurity::None` without
+    /// auto-reconnect cookies. Queued events are dropped as in [`run_connection_with`](Self::run_connection_with).
+    pub async fn run_connection_resumed<S>(&mut self, stream: S, resumed: Resumed) -> ServerResult<()>
+    where
+        S: AsyncRead + AsyncWrite + Send + Sync + Unpin,
+    {
+        self.connection_peer_addr = None;
+        let result = Box::pin(self.run_connection_resumed_inner(stream, resumed)).await;
+        self.connection_local_addr = None;
+        result
+    }
+
+    async fn run_connection_resumed_inner<S>(&mut self, stream: S, resumed: Resumed) -> ServerResult<()>
+    where
+        S: AsyncRead + AsyncWrite + Send + Sync + Unpin,
+    {
+        let (size, capabilities) = self.begin_connection().await;
+        let mut acceptor = Acceptor::new(resumed.security, size, capabilities, self.creds.clone());
+        acceptor.set_honor_client_desktop_size(self.opts.honor_client_desktop_size);
+        acceptor.set_accept_auto_reconnect(self.holds_auto_reconnect_cookie());
+        // Before the replay: Basic Settings gives channel IDs only to the static channels attached by then.
+        let channels = self.attach_channels(&mut acceptor).await;
+
+        acceptor
+            .replay(&resumed.steps)
+            .map_err_kind("replay", ServerErrorKind::Connector)?;
+        if !acceptor.is_licensing() {
+            return Err(ServerError::reason(
+                "replay",
+                format!(
+                    "the recording ends at {}, not LicensingExchange",
+                    acceptor.state().name()
+                ),
+            ));
+        }
+
+        self.finalize_negotiated(NegotiatedConnection {
+            transport: NegotiatedTransport::Offloaded(TokioFramed::new(stream)),
+            acceptor,
+            local_addr: None,
+            authenticated_credentials: None,
+            channels: Some(channels),
+        })
+        .await
+    }
+
     /// Completes negotiation and security setup without starting session finalization.
     ///
     /// The returned [`PendingSession`] owns the TCP connection until consumed or dropped.
@@ -3940,7 +4042,8 @@ impl RdpServer {
         self.finalize_negotiated(negotiated).await
     }
 
-    async fn prepare_pending_connection(&mut self) -> PendingConnection {
+    /// Clears the previous connection and returns the desktop size and capabilities a new acceptor starts with.
+    async fn begin_connection(&mut self) -> (DesktopSize, Vec<CapabilitySet>) {
         self.clear_bound_connection();
 
         // Before negotiation, so nothing the previous session left queued can
@@ -3949,7 +4052,11 @@ impl RdpServer {
         self.discard_stale_session_events().await;
 
         let size = self.display.lock().await.size().await;
-        let capabilities = capabilities::capabilities(&self.opts, size);
+        (size, capabilities::capabilities(&self.opts, size))
+    }
+
+    async fn prepare_pending_connection(&mut self) -> PendingConnection {
+        let (size, capabilities) = self.begin_connection().await;
         let mut pending = PendingConnection::new(
             self.opts.security.clone(),
             size,
@@ -3985,6 +4092,7 @@ impl RdpServer {
             acceptor,
             local_addr,
             authenticated_credentials,
+            channels,
         } = negotiated;
         self.clear_bound_connection();
         let _binding = BoundConnectionGuard {
@@ -4001,14 +4109,14 @@ impl RdpServer {
             // No security upgrade happened, so there is no TLS session to shut
             // down — matches the pre-existing `BeginResult::Continue` arm.
             NegotiatedTransport::Continued(framed) => {
-                self.accept_finalize(local_addr, framed, acceptor).await?;
+                self.accept_finalize(local_addr, framed, acceptor, channels).await?;
             }
             NegotiatedTransport::Tls(framed) => {
-                self.finalize_and_shutdown(local_addr, *framed, acceptor, "TLS connection")
+                self.finalize_and_shutdown(local_addr, *framed, acceptor, channels, "TLS connection")
                     .await?;
             }
             NegotiatedTransport::Offloaded(framed) => {
-                self.finalize_and_shutdown(local_addr, framed, acceptor, "TLS-offloaded stream")
+                self.finalize_and_shutdown(local_addr, framed, acceptor, channels, "TLS-offloaded stream")
                     .await?;
             }
         }
@@ -4025,6 +4133,7 @@ impl RdpServer {
         local_addr: Option<SocketAddr>,
         framed: TokioFramed<S>,
         acceptor: Acceptor,
+        channels: Option<ConnectionState>,
         shutdown_label: &str,
     ) -> ServerResult<()>
     where
@@ -4035,7 +4144,7 @@ impl RdpServer {
         // `PendingConnection::negotiate_and_authenticate` before this function
         // ever runs -- upstream's un-refactored equivalent still does that
         // work at this point, since it has no separate negotiation step.
-        let framed = self.accept_finalize(local_addr, framed, acceptor).await?;
+        let framed = self.accept_finalize(local_addr, framed, acceptor, channels).await?;
         debug!("Shutting down {}", shutdown_label);
         let (mut inner, _) = framed.into_inner();
         if let Err(e) = inner.shutdown().await {
@@ -4617,11 +4726,8 @@ impl RdpServer {
             .map_err(|error| ServerError::io("write_all", error))
     }
 
-    /// `conn.client_supports_errinfo` is the client's `RNS_UD_CS_SUPPORT_ERRINFO_PDU`
-    /// early-capability opt-in: MS-RDPBCGR 3.3.5.7.1 forbids sending a Server
-    /// Set Error Info PDU to a client that did not set it, so the two arms below
-    /// that carry a disconnect reason drop the PDU (and just disconnect) when it
-    /// is `false`.
+    /// The two arms below that carry a disconnect reason send it to every
+    /// client, then the Disconnect Provider Ultimatum.
     #[expect(
         clippy::too_many_arguments,
         reason = "private per-connection dispatch; the parameters are the connection's negotiated identifiers and transports"
@@ -4847,8 +4953,7 @@ impl RdpServer {
                     // Best-effort: if the evicted peer's socket is already
                     // half-dead the write fails, which is fine — it is leaving
                     // either way, and the caller falls back to cancelling it.
-                    send_error_info(
-                        conn,
+                    send_reason_and_ultimatum(
                         writer,
                         io_channel_id,
                         user_channel_id,
@@ -4860,22 +4965,7 @@ impl RdpServer {
                 }
                 ServerEvent::Disconnect(error) => {
                     debug!(?error, "Got disconnect event");
-                    if !conn.client_supports_errinfo {
-                        // Same MS-RDPBCGR 3.3.5.7.1 rule as the eviction arm.
-                        debug!("client did not opt into Set Error Info PDUs; disconnecting without the reason");
-                        return Ok(RunState::Disconnect);
-                    }
-                    let pdu = rdp::headers::ShareDataPdu::ServerSetErrorInfo(ServerSetErrorInfoPdu(error));
-                    // pduSource=0, not user_channel_id -- same MS-RDPBCGR
-                    // 2.2.5.1.1 requirement as the EvictedByOtherConnection
-                    // arm above; upstream's original call here (before this
-                    // merge) predated that parameter and used
-                    // user_channel_id, which this fixes to match.
-                    let data = encode_share_data_pdu(pdu, 0, io_channel_id, user_channel_id)?;
-                    writer
-                        .write_all(&data)
-                        .await
-                        .map_err(|e| ServerError::io("send server set error info", e))?;
+                    send_reason_and_ultimatum(writer, io_channel_id, user_channel_id, error, "disconnect reason").await;
                     return Ok(RunState::Disconnect);
                 }
                 ServerEvent::Redirect(redirection) => {
@@ -5682,8 +5772,7 @@ impl RdpServer {
             Ok(display_updates) => display_updates,
             Err(error) => {
                 if let ServerErrorKind::ErrorInfo(error_info) = *error.kind() {
-                    send_error_info(
-                        conn,
+                    send_reason_and_ultimatum(
                         writer,
                         io_channel_id,
                         user_channel_id,
@@ -5973,6 +6062,8 @@ impl RdpServer {
         if !result.reactivation {
             with_connection_handler(self.connection_handler.as_ref(), |h| {
                 h.on_connection_info(&ConnectionInfo {
+                    client_version: result.client_version,
+                    client_build: result.client_build,
                     keyboard_layout: result.keyboard_layout,
                     keyboard_type: result.keyboard_type,
                     keyboard_subtype: result.keyboard_subtype,
@@ -5983,6 +6074,7 @@ impl RdpServer {
                     performance_flags: result.performance_flags,
                     auto_reconnect: is_auto_reconnect,
                     client_monitors: result.client_monitors,
+                    client_monitors_ex: result.client_monitors_ex,
                     routing_token: result.routing_token.clone(),
                     redirected_session_id: result
                         .client_cluster_data
@@ -5993,7 +6085,7 @@ impl RdpServer {
                                 .contains(ironrdp_pdu::gcc::RedirectionFlags::REDIRECTED_SESSION_FIELD_VALID)
                         })
                         .map(|cluster| cluster.redirected_session_id),
-                    password_cookie: result.password_cookie.clone(),
+                    password_cookie: result.password_cookie,
                     client_info_flags: result.client_info_flags,
                     peer_addr: self.connection_peer_addr,
                 });
@@ -6031,9 +6123,6 @@ impl RdpServer {
         conn.client_supports_heartbeat = result
             .client_early_capability_flags
             .contains(ironrdp_pdu::gcc::ClientEarlyCapabilityFlags::SUPPORT_HEART_BEAT_PDU);
-        conn.client_supports_errinfo = result
-            .client_early_capability_flags
-            .contains(ironrdp_pdu::gcc::ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU);
         // A client can join the rdpsnd channel although it asked for no audio redirection, as some do for device
         // redirection, so the channel is left joined but never started: no Server Audio Formats PDU goes out, and the
         // sound handler is never asked to start.
@@ -6370,11 +6459,16 @@ impl RdpServer {
         local_addr: Option<SocketAddr>,
         mut framed: TokioFramed<S>,
         mut acceptor: Acceptor,
+        channels: Option<ConnectionState>,
     ) -> ServerResult<TokioFramed<S>>
     where
         S: AsyncRead + AsyncWrite + Sync + Send + Unpin,
     {
-        let mut conn = self.attach_channels(&mut acceptor).await;
+        acceptor.set_accept_auto_reconnect(self.holds_auto_reconnect_cookie());
+        let mut conn = match channels {
+            Some(conn) => conn,
+            None => self.attach_channels(&mut acceptor).await,
+        };
         let udp_bind_addr = self
             .opts
             .udp_bind_addr
@@ -6756,26 +6850,17 @@ fn encode_share_data_pdu(
 }
 
 /// Tells the client why the session ends: sends `error_info` in a Set Error Info PDU ([MS-RDPBCGR 2.2.5.1.1]),
-/// best-effort. A client that did not set RNS_UD_CS_SUPPORT_ERRINFO_PDU is not sent the PDU ([MS-RDPBCGR 3.3.5.7.1]).
-/// `reason` names the reason in the logs.
+/// best-effort. Every client is sent it, including one that left RNS_UD_CS_SUPPORT_ERRINFO_PDU off, as FreeRDP 3
+/// does by default. `reason` names the reason in the logs.
 ///
 /// [MS-RDPBCGR 2.2.5.1.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/a21a1bd9-2303-49c1-90ec-3932435c248c
-/// [MS-RDPBCGR 3.3.5.7.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/e895ef8f-829a-4166-ad29-7d64d200c136
 async fn send_error_info(
-    conn: &ConnectionState,
     writer: &mut impl FramedWrite,
     io_channel_id: u16,
     user_channel_id: u16,
     error_info: ErrorInfo,
     reason: &str,
 ) {
-    if !conn.client_supports_errinfo {
-        debug!(
-            reason,
-            "Client did not opt into Set Error Info PDUs; disconnecting without the reason"
-        );
-        return;
-    }
     let pdu = rdp::headers::ShareDataPdu::ServerSetErrorInfo(ServerSetErrorInfoPdu(error_info));
     // pduSource=0 -- MS-RDPBCGR 2.2.5.1.1 requires it for TS_SET_ERROR_INFO_PDU.
     match encode_share_data_pdu(pdu, 0, io_channel_id, user_channel_id) {
@@ -6786,6 +6871,41 @@ async fn send_error_info(
         }
         Err(error) => {
             warn!(%error, reason, "Could not encode the reason; disconnecting anyway");
+        }
+    }
+}
+
+/// Tells the client why the server ends the connection: the Set Error Info PDU,
+/// then the Disconnect Provider Ultimatum, so a client that ignores the reason
+/// still does not auto-reconnect.
+async fn send_reason_and_ultimatum(
+    writer: &mut impl FramedWrite,
+    io_channel_id: u16,
+    user_channel_id: u16,
+    error_info: ErrorInfo,
+    reason: &str,
+) {
+    send_error_info(writer, io_channel_id, user_channel_id, error_info, reason).await;
+    send_disconnect_ultimatum(writer).await;
+}
+
+/// Sends the MCS Disconnect Provider Ultimatum that ends a server-initiated
+/// disconnection (MS-RDPBCGR 1.3.1.4.2), best-effort.
+///
+/// It follows the Set Error Info PDU and tells a client that ignores that PDU
+/// that the server ended the connection on purpose: FreeRDP maps a provider-initiated ultimatum to
+/// `ERRINFO_RPC_INITIATED_DISCONNECT` and then does not auto-reconnect, as it
+/// does after a socket that just closes.
+async fn send_disconnect_ultimatum(writer: &mut impl FramedWrite) {
+    let ultimatum = mcs::DisconnectProviderUltimatum::from_reason(mcs::DisconnectReason::ProviderInitiated);
+    match encode_vec(&X224(mcs::McsMessage::DisconnectProviderUltimatum(ultimatum))) {
+        Ok(bytes) => {
+            if let Err(error) = writer.write_all(&bytes).await {
+                debug!(%error, "Could not send the disconnect ultimatum; disconnecting anyway");
+            }
+        }
+        Err(error) => {
+            warn!(%error, "Could not encode the disconnect ultimatum; disconnecting anyway");
         }
     }
 }
@@ -6981,6 +7101,17 @@ impl ConnectionSetupHandler for RdpServer {
         self.prepare_authenticated_connection(credentials).await
     }
 
+    async fn choose_desktop_size(
+        &mut self,
+        client_monitors: &[ironrdp_pdu::gcc::Monitor],
+        desktop_size: DesktopSize,
+    ) -> DesktopSize {
+        with_connection_handler(self.connection_handler.as_ref(), |handler| {
+            handler.choose_desktop_size(client_monitors, desktop_size)
+        })
+        .unwrap_or(desktop_size)
+    }
+
     async fn prepare_capability_exchange(&mut self, desktop_size: DesktopSize) -> Result<(), ConnectorError> {
         if (self.credential_validator.is_some() || self.connection_binder.is_some())
             && self
@@ -7025,7 +7156,7 @@ impl ConnectionSetupHandler for RdpServer {
 mod preempt_tests {
     use core::net::Ipv4Addr;
 
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::io::AsyncReadExt as _;
     use tokio::net::TcpListener;
 
     use super::*;
@@ -7812,10 +7943,7 @@ mod cliprdr_error_tests {
         // Left in its initial state, so `require_ready` refuses the request
         // below -- the cheapest reproduction of "the channel said no".
         let cliprdr: CliprdrServer = Cliprdr::new(Box::new(SilentBackend));
-        let mut conn = ConnectionState {
-            client_supports_errinfo: true,
-            ..ConnectionState::default()
-        };
+        let mut conn = ConnectionState::default();
         conn.static_channels.insert(cliprdr);
         conn.static_channels
             .attach_channel_id(TypeId::of::<CliprdrServer>(), 1004);
@@ -7850,6 +7978,35 @@ mod cliprdr_error_tests {
             "the session must keep running after a refused clipboard message, got {state:?}"
         );
         assert!(writer.0.is_empty(), "a refused message has nothing to put on the wire");
+    }
+
+    struct LimitedClipboard(Option<usize>);
+
+    impl ironrdp_cliprdr::backend::CliprdrBackendFactory for LimitedClipboard {
+        fn build_cliprdr_backend(&self) -> Box<dyn CliprdrBackend> {
+            Box::new(SilentBackend)
+        }
+    }
+
+    impl ServerEventSender for LimitedClipboard {
+        fn set_sender(&mut self, _sender: mpsc::UnboundedSender<ServerEvent>) {}
+    }
+
+    impl CliprdrServerFactory for LimitedClipboard {
+        fn max_message_size(&self) -> Option<usize> {
+            self.0
+        }
+    }
+
+    #[test]
+    fn the_clipboard_channel_takes_the_limit_its_factory_asks_for() {
+        use ironrdp_svc::SvcProcessor as _;
+
+        assert_eq!(
+            cliprdr_channel(&LimitedClipboard(Some(1 << 20))).max_message_size(),
+            Some(1 << 20)
+        );
+        assert_eq!(cliprdr_channel(&LimitedClipboard(None)).max_message_size(), None);
     }
 }
 
@@ -7984,35 +8141,143 @@ mod credential_binding_tests {
 #[cfg(test)]
 mod tests {
     use core::future::pending;
+    use core::net::Ipv4Addr;
 
-    use ironrdp_core::{Encode as _, WriteCursor, impl_as_any};
+    use ironrdp_core::{WriteCursor, impl_as_any};
     use ironrdp_dvc::DvcProcessor as _;
     use ironrdp_svc::{SvcMessage, SvcServerProcessor};
 
     use super::*;
 
-    /// A client that did not set RNS_UD_CS_SUPPORT_ERRINFO_PDU is not sent a
-    /// Set Error Info PDU; a client that set it is.
-    // oracle: spec MS-RDPBCGR §3.3.5.7.1
+    /// Every client is sent the Set Error Info PDU, whatever its
+    /// RNS_UD_CS_SUPPORT_ERRINFO_PDU flag says.
+    // oracle: spec MS-RDPBCGR §2.2.5.1.1
     #[tokio::test]
-    async fn the_error_reason_goes_only_to_a_client_that_supports_it() {
+    async fn the_error_reason_goes_to_every_client() {
         let error_info = ErrorInfo::ProtocolIndependentCode(ProtocolIndependentCode::ServerInsufficientPrivileges);
-        let mut conn = ConnectionState::default();
-
         let mut writer = cliprdr_error_tests::CapturingWriter::default();
-        send_error_info(&conn, &mut writer, 1003, 1007, error_info, "test").await;
-        assert!(writer.0.is_empty(), "sent to a client that does not support it");
+        send_error_info(&mut writer, 1003, 1007, error_info, "test").await;
+        assert_eq!(writer.0, reason_pdu(error_info, 1003, 1007));
+    }
 
-        conn.client_supports_errinfo = true;
-        send_error_info(&conn, &mut writer, 1003, 1007, error_info, "test").await;
-        let expected = encode_share_data_pdu(
+    /// A display that cannot start sends its reason, then the ultimatum.
+    // oracle: spec MS-RDPBCGR §1.3.1.4.2
+    #[tokio::test]
+    async fn a_display_error_ends_with_the_ultimatum_after_the_reason() {
+        let error_info = ErrorInfo::ProtocolIndependentCode(ProtocolIndependentCode::CloseStackOnDriverFailure);
+        let mut writer = cliprdr_error_tests::CapturingWriter::default();
+        send_reason_and_ultimatum(&mut writer, 1003, 1007, error_info, "test").await;
+        assert_eq!(
+            writer.0,
+            [reason_pdu(error_info, 1003, 1007), ultimatum_pdu().await].concat()
+        );
+    }
+
+    /// `ErrorInfoDisconnectHandle::disconnect` sends its code to a client that
+    /// did not set RNS_UD_CS_SUPPORT_ERRINFO_PDU, then the ultimatum.
+    // oracle: spec MS-RDPBCGR §2.2.5.1.1
+    #[tokio::test]
+    async fn a_disconnect_event_sends_its_reason_then_the_ultimatum() {
+        for (code, value) in [
+            (ProtocolIndependentCode::DisconnectedByOtherconnection, 0x5),
+            (ProtocolIndependentCode::RpcInitiatedDisconnectByuser, 0xB),
+            (ProtocolIndependentCode::LogoffByUser, 0xC),
+        ] {
+            let error_info = ErrorInfo::ProtocolIndependentCode(code);
+            let written = dispatch_one(ServerEvent::Disconnect(error_info)).await;
+
+            let reason = reason_pdu(error_info, 1003, 1002);
+            assert_eq!(written, [reason.clone(), ultimatum_pdu().await].concat(), "{code:?}");
+            assert_eq!(decode_reason(&written[..reason.len()]), error_info);
+            assert_eq!(code.as_u32(), value);
+        }
+    }
+
+    /// An evicted client is told `DisconnectedByOtherconnection`, then the
+    /// ultimatum.
+    // oracle: spec MS-RDPBCGR §2.2.5.1.1
+    #[tokio::test]
+    async fn an_eviction_sends_disconnected_by_other_connection_then_the_ultimatum() {
+        let written = dispatch_one(ServerEvent::EvictedByOtherConnection).await;
+        let error_info = ErrorInfo::ProtocolIndependentCode(ProtocolIndependentCode::DisconnectedByOtherconnection);
+        assert_eq!(
+            written,
+            [reason_pdu(error_info, 1003, 1002), ultimatum_pdu().await].concat()
+        );
+    }
+
+    /// Runs `event` through `dispatch_server_events` on a default connection
+    /// (no RNS_UD_CS_SUPPORT_ERRINFO_PDU) and returns what it wrote.
+    async fn dispatch_one(event: ServerEvent) -> Vec<u8> {
+        let mut server = RdpServer::builder()
+            .with_addr((Ipv4Addr::LOCALHOST, 0))
+            .with_no_security()
+            .with_no_input()
+            .with_no_display()
+            .build();
+        let mut conn = ConnectionState::default();
+        let mut writer = cliprdr_error_tests::CapturingWriter::default();
+        let state = server
+            .dispatch_server_events(
+                &mut conn,
+                &mut vec![event],
+                &mut SharedWriter::new(&mut writer),
+                1003,
+                1002,
+                None,
+                None,
+            )
+            .await
+            .expect("dispatch");
+        assert!(matches!(state, RunState::Disconnect), "the connection must end");
+        writer.0
+    }
+
+    fn reason_pdu(error_info: ErrorInfo, io_channel_id: u16, user_channel_id: u16) -> Vec<u8> {
+        encode_share_data_pdu(
             rdp::headers::ShareDataPdu::ServerSetErrorInfo(ServerSetErrorInfoPdu(error_info)),
             0,
-            1003,
-            1007,
+            io_channel_id,
+            user_channel_id,
         )
-        .expect("encode");
-        assert_eq!(writer.0, expected);
+        .expect("encode")
+    }
+
+    async fn ultimatum_pdu() -> Vec<u8> {
+        let mut writer = cliprdr_error_tests::CapturingWriter::default();
+        send_disconnect_ultimatum(&mut writer).await;
+        writer.0
+    }
+
+    fn decode_reason(bytes: &[u8]) -> ErrorInfo {
+        let x224: X224<mcs::McsMessage<'_>> = decode(bytes).expect("decode X.224/MCS");
+        let mcs::McsMessage::SendDataIndication(data) = x224.0 else {
+            panic!("expected a Send Data Indication, got {:?}", x224.0);
+        };
+        let control: rdp::headers::ShareControlHeader = decode(data.user_data.as_ref()).expect("decode share control");
+        let ShareControlPdu::Data(header) = control.share_control_pdu else {
+            panic!("expected a share data PDU");
+        };
+        let rdp::headers::ShareDataPdu::ServerSetErrorInfo(ServerSetErrorInfoPdu(error_info)) = header.share_data_pdu
+        else {
+            panic!("expected a Set Error Info PDU");
+        };
+        error_info
+    }
+
+    /// A server-initiated disconnect ends with a provider-initiated Disconnect
+    /// Provider Ultimatum, which FreeRDP clients read as deliberate even
+    /// without a Set Error Info PDU.
+    // oracle: spec MS-RDPBCGR §1.3.1.4.2
+    #[tokio::test]
+    async fn the_disconnect_ultimatum_is_provider_initiated() {
+        let mut writer = cliprdr_error_tests::CapturingWriter::default();
+        send_disconnect_ultimatum(&mut writer).await;
+        let x224: X224<mcs::McsMessage<'_>> = decode(&writer.0).expect("decode X.224/MCS");
+        let mcs::McsMessage::DisconnectProviderUltimatum(ultimatum) = x224.0 else {
+            panic!("expected a Disconnect Provider Ultimatum, got {:?}", x224.0);
+        };
+        assert_eq!(ultimatum.reason, mcs::DisconnectReason::ProviderInitiated);
     }
 
     /// A channel backend that owns a resource, released on drop the way
@@ -8167,6 +8432,27 @@ mod tests {
         }
 
         assert_eq!(*requested.lock().unwrap(), [first, second]);
+    }
+
+    #[test]
+    fn every_channel_the_server_reads_reassembles_a_bounded_message() {
+        use ironrdp_dvc::DvcProcessor as _;
+        use ironrdp_svc::SvcProcessor as _;
+
+        let limits = [
+            ("drdynvc", dvc::DrdynvcServer::new().max_message_size()),
+            (
+                "ainput",
+                AInputHandler::new(Arc::new(AtomicBool::new(false))).max_message_size(),
+            ),
+            (
+                "displaycontrol",
+                DisplayControlServer::new(DisplayControlCapabilities::single_monitor()).max_message_size(),
+            ),
+        ];
+        for (channel, limit) in limits {
+            assert!(limit.is_some(), "{channel} has no reassembly limit");
+        }
     }
 
     // oracle: spec MS-RDPEDISP §2.2.2.1, MaxNumMonitors is the number of monitors the server supports.
@@ -8349,12 +8635,14 @@ mod tests {
             [
                 ConnectionOutput::Keyboard(KeyboardEvent::Pressed {
                     code: 30,
-                    extended: false
+                    extended: false,
+                    extended1: false
                 }),
                 ConnectionOutput::Mouse(MouseEvent::Move { x: 12, y: 34 }),
                 ConnectionOutput::Keyboard(KeyboardEvent::Released {
                     code: 30,
-                    extended: false
+                    extended: false,
+                    extended1: false
                 }),
             ]
         ));
@@ -8539,7 +8827,7 @@ mod cliprdr_timeout_tests {
         ClipboardPdu, ClipboardProtocolVersion, FileContentsRequest, FileContentsResponse, FormatDataRequest,
         FormatDataResponse, FormatList, LockDataId,
     };
-    use ironrdp_core::{Encode as _, WriteCursor, impl_as_any};
+    use ironrdp_core::{WriteCursor, impl_as_any};
 
     use super::cliprdr_error_tests::CapturingWriter;
     use super::*;

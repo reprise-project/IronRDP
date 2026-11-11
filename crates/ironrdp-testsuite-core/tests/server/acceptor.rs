@@ -6,9 +6,9 @@ use std::io;
 use std::rc::Rc;
 
 use ironrdp_acceptor::{
-    Acceptor, AcceptorResult, ChannelConnectionSequence, ConnectionSetupHandler, FinalizationSequence,
-    MultitransportSecurityRng, ReceivedCredentials, accept_begin, accept_credssp_with, accept_finalize,
-    accept_finalize_with,
+    Acceptor, AcceptorResult, ChannelConnectionSequence, ConnectionSetupHandler, CredsspAuthIdentity,
+    FinalizationSequence, MultitransportSecurityRng, ReceivedCredentials, accept_begin, accept_credssp_with,
+    accept_finalize, accept_finalize_with,
 };
 use ironrdp_async::bytes::BytesMut;
 use ironrdp_async::{Framed, FramedRead, FramedWrite, NetworkClient, StreamWrapper};
@@ -16,7 +16,7 @@ use ironrdp_connector::credssp::CredsspSequence;
 use ironrdp_connector::sspi::credssp::{ClientMode, ClientState, CredSspClient, CredSspMode, NStatusCode, TsRequest};
 use ironrdp_connector::sspi::generator::{GeneratorState, NetworkRequest};
 use ironrdp_connector::sspi::ntlm::NtlmConfig;
-use ironrdp_connector::sspi::{AuthIdentity, NegotiateConfig, Username};
+use ironrdp_connector::sspi::{self, AuthIdentity, NTLM_HASH_PREFIX, NegotiateConfig, Username};
 use ironrdp_connector::{
     ConnectorError, ConnectorErrorExt as _, ConnectorErrorKind, ConnectorResult, DesktopSize, Sequence, Written,
     encode_x224_packet,
@@ -1322,6 +1322,29 @@ fn scale_factors_survive_reactivation() {
     );
 }
 
+/// The client's `version` and `clientBuild` from its GCC Client Core Data (MS-RDPBCGR 2.2.1.3.2) reach the result,
+/// and a Deactivation-Reactivation, which doesn't resend that block, hands them back unchanged.
+#[test]
+fn client_version_and_build_are_kept_as_sent() {
+    let mut client_blocks = CLIENT_GCC_WITHOUT_OPTIONAL_FIELDS.clone();
+    client_blocks.core.version = ironrdp_pdu::gcc::RdpVersion::V10_12;
+    client_blocks.core.client_build = 26100;
+    let (acceptor, result, user_channel_id, io_channel_id) = accepted(client_blocks, &CLIENT_INFO_PDU_BUFFER);
+    assert_eq!(
+        (result.client_version, result.client_build),
+        (ironrdp_pdu::gcc::RdpVersion::V10_12, 26100)
+    );
+
+    let mut acceptor = Acceptor::new_deactivation_reactivation(acceptor, result.static_channels, DESKTOP_SIZE)
+        .expect("rebuild the acceptor for reactivation");
+    let result = result_after_activation(&mut acceptor, user_channel_id, io_channel_id);
+    assert!(result.reactivation);
+    assert_eq!(
+        (result.client_version, result.client_build),
+        (ironrdp_pdu::gcc::RdpVersion::V10_12, 26100)
+    );
+}
+
 #[derive(Default)]
 struct HandshakeStream {
     incoming: VecDeque<Vec<u8>>,
@@ -1545,8 +1568,17 @@ fn negotiated_acceptor_expecting(protocol: SecurityProtocol, creds: Option<Crede
 }
 
 fn post_credssp_messages(error_info: Option<ClientEarlyCapabilityFlags>) -> VecDeque<Vec<u8>> {
+    post_credssp_messages_with_monitors(error_info, None)
+}
+
+/// [`post_credssp_messages`], with `monitors` as the client's Client Monitor Data, or no such block when `None`.
+fn post_credssp_messages_with_monitors(
+    error_info: Option<ClientEarlyCapabilityFlags>,
+    monitors: Option<Vec<Monitor>>,
+) -> VecDeque<Vec<u8>> {
     let mut gcc = CLIENT_GCC_WITHOUT_OPTIONAL_FIELDS.clone();
     gcc.network = None;
+    gcc.monitor = monitors.map(|monitors| ClientMonitorData { monitors });
     gcc.core.optional_data = ClientCoreOptionalData {
         post_beta2_color_depth: gcc.core.optional_data.post_beta2_color_depth,
         client_product_id: gcc.core.optional_data.client_product_id,
@@ -2026,6 +2058,280 @@ async fn credssp_failed_logon_is_reported_as_logon_failure(
     assert_eq!(ts_request.error_code, Some(NStatusCode::LOGON_FAILURE));
 }
 
+/// Which framing a hand-driven CredSSP client puts its NTLM messages in.
+#[derive(Clone, Copy, Debug)]
+enum Wrapping {
+    /// Bare NTLM, as the connector's client sends it.
+    Bare,
+    /// NTLM wrapped in SPNEGO, as mstsc sends it.
+    Spnego,
+}
+
+enum HandClient {
+    Bare(Box<CredsspSequence>),
+    Spnego(Box<CredSspClient>),
+}
+
+impl HandClient {
+    /// Returns the client and its first message.
+    fn start(wrapping: Wrapping, username: &str, password: &str, public_key: &[u8]) -> (Self, Vec<u8>) {
+        match wrapping {
+            Wrapping::Bare => {
+                let (mut client, request) = CredsspSequence::init(
+                    ironrdp_connector::Credentials::UsernamePassword {
+                        username: username.to_owned(),
+                        password: password.to_owned(),
+                    },
+                    None,
+                    SecurityProtocol::HYBRID,
+                    "server.example.com".to_owned().into(),
+                    public_key.to_vec(),
+                    None,
+                )
+                .unwrap();
+                let message = client_credssp_message(&mut client, request);
+                (Self::Bare(Box::new(client)), message)
+            }
+            Wrapping::Spnego => {
+                let mut client = spnego_credssp_client(username, password, public_key);
+                let message = spnego_credssp_message(&mut client, TsRequest::default());
+                (Self::Spnego(Box::new(client)), message)
+            }
+        }
+    }
+
+    fn answer(&mut self, reply: &[u8]) -> Vec<u8> {
+        match self {
+            Self::Bare(client) => {
+                let request = client.decode_server_message(reply).unwrap().unwrap();
+                client_credssp_message(client, request)
+            }
+            Self::Spnego(client) => spnego_credssp_message(client, TsRequest::from_buffer(reply).unwrap()),
+        }
+    }
+}
+
+enum Exchange {
+    Accepted,
+    /// The server's last answer and the error its sequence ended on.
+    Refused {
+        reply: Vec<u8>,
+        error: ConnectorError,
+    },
+}
+
+/// Runs CredSSP between a client logging on as `username`/`password` and the acceptor's sequence for alice/secret,
+/// outside the panic guard of `accept_credssp_with`.
+fn hand_driven_credssp(wrapping: Wrapping, username: &str, password: &str, alteration: Alteration) -> Exchange {
+    let public_key = vec![0x42; 32];
+    let identity = AuthIdentity {
+        username: Username::new("alice", None).unwrap(),
+        password: "secret".to_owned().into(),
+    };
+    let mut server = ironrdp_acceptor::credssp::CredsspSequence::init(
+        &identity,
+        "client.example.com".to_owned().into(),
+        public_key.clone(),
+        None,
+    )
+    .unwrap();
+    let (mut client, mut message) = HandClient::start(wrapping, username, password, &public_key);
+
+    let mut step = 0;
+    loop {
+        alteration.apply(step, &mut message);
+        let request = match server.decode_client_message(&message) {
+            Ok(request) => request.expect("the server reads every client message"),
+            Err(error) => {
+                return Exchange::Refused {
+                    reply: Vec::new(),
+                    error,
+                };
+            }
+        };
+        let result = {
+            let mut generator = server.process_ts_request(request);
+            let GeneratorState::Completed(result) = generator.start() else {
+                panic!("NTLM should not make network requests");
+            };
+            result
+        };
+        let mut buf = WriteBuf::new();
+        server.handle_process_result(result, &mut buf).unwrap();
+        let reply = buf.filled().to_vec();
+        match server.next_pdu_hint() {
+            Err(error) => return Exchange::Refused { reply, error },
+            Ok(None) => return Exchange::Accepted,
+            Ok(Some(_)) => message = client.answer(&reply),
+        }
+        step += 1;
+    }
+}
+
+/// The sspi error kind somewhere in `error`'s source chain.
+fn sspi_error_kind(error: &ConnectorError) -> Option<sspi::ErrorKind> {
+    let error: &dyn core::error::Error = error;
+    core::iter::successors(Some(error), |error| error.source())
+        .find_map(|error| error.downcast_ref::<sspi::Error>())
+        .map(|error| error.error_type)
+}
+
+/// The answer to a failed logon: a TsRequest that carries STATUS_LOGON_FAILURE and nothing else.
+fn logon_failure_answer() -> Vec<u8> {
+    let mut answer = Vec::new();
+    TsRequest {
+        error_code: Some(NStatusCode::LOGON_FAILURE),
+        ..TsRequest::default()
+    }
+    .encode_ts_request(&mut answer)
+    .unwrap();
+    answer
+}
+
+fn edit_ts_request(message: &mut Vec<u8>, edit: impl FnOnce(&mut TsRequest)) {
+    let mut request = TsRequest::from_buffer(message).unwrap();
+    edit(&mut request);
+    message.clear();
+    request.encode_ts_request(message).unwrap();
+}
+
+fn find_once(haystack: &[u8], needle: &[u8]) -> usize {
+    let mut found = haystack
+        .windows(needle.len())
+        .enumerate()
+        .filter(|(_, window)| *window == needle)
+        .map(|(at, _)| at);
+    let at = found.next().expect("the message holds the pattern");
+    assert!(found.next().is_none(), "the message holds the pattern once");
+    at
+}
+
+/// Clears the MIC bit of the MsvAvFlags AV pair in the client's NTLMv2 response ([MS-NLMP] 2.2.2.1), keeping every
+/// length, so that the AUTHENTICATE no longer says it carries a MIC.
+fn clear_mic_flag(message: &mut [u8]) {
+    const AV_FLAGS_WITH_MIC: [u8; 8] = [0x06, 0x00, 0x04, 0x00, 0x02, 0x00, 0x00, 0x00];
+    let at = find_once(message, &AV_FLAGS_WITH_MIC);
+    message[at + 4] = 0;
+}
+
+/// Clears NTLMSSP_NEGOTIATE_TARGET_INFO (0x0080_0000) in the AUTHENTICATE's NegotiateFlags, the u32 at offset 60
+/// ([MS-NLMP] 2.2.1.3, 2.2.2.5), so that the 16 bytes after the Version are no longer read as a MIC.
+fn clear_target_info_flag(message: &mut [u8]) {
+    let at = find_once(message, b"NTLMSSP\0\x03\0\0\0");
+    message[at + 62] &= !0x80;
+}
+
+/// A change to the client's messages that makes the logon fail after its AUTHENTICATE.
+#[derive(Clone, Copy, Debug)]
+enum Alteration {
+    None,
+    AuthenticateWithoutMicFlag,
+    AuthenticateWithoutTargetInfo,
+    PublicKeyProofEmpty,
+    PublicKeyProofCutTo15Bytes,
+    PublicKeyProofAltered,
+    CredentialsAltered,
+}
+
+impl Alteration {
+    /// Rewrites client message `step`, numbered from 0, before the server reads it.
+    fn apply(self, step: usize, message: &mut Vec<u8>) {
+        match (self, step) {
+            (Self::AuthenticateWithoutMicFlag, 1) => clear_mic_flag(message),
+            (Self::AuthenticateWithoutTargetInfo, 1) => clear_target_info_flag(message),
+            (Self::PublicKeyProofEmpty, 1) => {
+                edit_ts_request(message, |request| request.pub_key_auth.as_mut().unwrap().clear());
+            }
+            (Self::PublicKeyProofCutTo15Bytes, 1) => {
+                edit_ts_request(message, |request| request.pub_key_auth.as_mut().unwrap().truncate(15));
+            }
+            (Self::PublicKeyProofAltered, 1) => edit_ts_request(message, |request| {
+                *request.pub_key_auth.as_mut().unwrap().last_mut().unwrap() ^= 1;
+            }),
+            (Self::CredentialsAltered, 2) => edit_ts_request(message, |request| {
+                *request.auth_info.as_mut().unwrap().last_mut().unwrap() ^= 1;
+            }),
+            _ => {}
+        }
+    }
+}
+
+/// Once the client has sent its NTLM AUTHENTICATE, every failure gets the same answer, so that it tells neither
+/// whether the account exists nor which check refused the logon. The server's own error keeps the reason.
+#[rstest::rstest]
+#[case::wrong_password(Wrapping::Bare, "alice", "wrong", Alteration::None, sspi::ErrorKind::LogonDenied)]
+#[case::unknown_user(Wrapping::Bare, "bob", "secret", Alteration::None, sspi::ErrorKind::LogonDenied)]
+#[case::spnego_wrong_password(Wrapping::Spnego, "alice", "wrong", Alteration::None, sspi::ErrorKind::LogonDenied)]
+#[case::spnego_unknown_user(Wrapping::Spnego, "bob", "secret", Alteration::None, sspi::ErrorKind::NoCredentials)]
+#[case::wrong_password_without_mic(
+    Wrapping::Bare,
+    "alice",
+    "wrong",
+    Alteration::AuthenticateWithoutMicFlag,
+    sspi::ErrorKind::InvalidToken
+)]
+#[case::public_key_proof_empty(
+    Wrapping::Bare,
+    "alice",
+    "secret",
+    Alteration::PublicKeyProofEmpty,
+    sspi::ErrorKind::InvalidToken
+)]
+#[case::public_key_proof_shorter_than_a_signature(
+    Wrapping::Bare,
+    "alice",
+    "secret",
+    Alteration::PublicKeyProofCutTo15Bytes,
+    sspi::ErrorKind::InvalidToken
+)]
+#[case::public_key_proof_altered(
+    Wrapping::Bare,
+    "alice",
+    "secret",
+    Alteration::PublicKeyProofAltered,
+    sspi::ErrorKind::MessageAltered
+)]
+#[case::credentials_altered(
+    Wrapping::Bare,
+    "alice",
+    "secret",
+    Alteration::CredentialsAltered,
+    sspi::ErrorKind::MessageAltered
+)]
+fn credssp_answers_every_failure_after_the_authenticate_alike(
+    #[case] wrapping: Wrapping,
+    #[case] username: &str,
+    #[case] password: &str,
+    #[case] alteration: Alteration,
+    #[case] reason: sspi::ErrorKind,
+) {
+    let Exchange::Refused { reply, error } = hand_driven_credssp(wrapping, username, password, alteration) else {
+        panic!("the logon should fail");
+    };
+
+    // oracle: spec MS-CSSP §2.2.1 and MS-ERREF §2.3.1: errorCode carries STATUS_LOGON_FAILURE for bad authentication information.
+    assert_eq!(reply, logon_failure_answer());
+    // oracle: mutant answering every failure alike and losing the server's reason with it.
+    assert_eq!(sspi_error_kind(&error), Some(reason));
+}
+
+/// The server's CHALLENGE carries MsvAvTimestamp, so an NTLMv2 client must send a MIC ([MS-NLMP] 3.1.5.1.2), and the
+/// MIC is what checks the password in the AUTHENTICATE. One without a MIC is refused even with the right password.
+#[rstest::rstest]
+fn credssp_refuses_an_authenticate_without_a_mic(
+    #[values(Wrapping::Bare, Wrapping::Spnego)] wrapping: Wrapping,
+    #[values(Alteration::AuthenticateWithoutMicFlag, Alteration::AuthenticateWithoutTargetInfo)] alteration: Alteration,
+) {
+    let exchange = hand_driven_credssp(wrapping, "alice", "secret", alteration);
+
+    // oracle: spec MS-NLMP §3.1.5.1.2 and §3.2.5.1.2: with MsvAvTimestamp in the CHALLENGE the client provides a MIC.
+    let Exchange::Refused { reply, error } = exchange else {
+        panic!("an AUTHENTICATE without a MIC should be refused");
+    };
+    assert_eq!(reply, logon_failure_answer());
+    assert_eq!(sspi_error_kind(&error), Some(sspi::ErrorKind::InvalidToken));
+}
+
 /// The server Demand Active carries `RDP` as its source descriptor, as the FreeRDP
 /// server does; some clients (Jump Desktop) refuse an empty one.
 #[test]
@@ -2149,9 +2455,9 @@ fn stepping_a_failed_finalization_returns_an_error() {
     sequence.step(&vc_frame, None, &mut WriteBuf::new()).unwrap_err();
 }
 
-// oracle: spec MS-RDPBCGR §2.2.12.1 (the pduSource field of the Monitor Layout PDU MUST be set to zero)
-#[test]
-fn monitor_layout_pdu_source_is_zero() {
+/// Drives a fresh 1920x1080 acceptor up to the Monitor Layout PDU, for a client that supports it and sent `monitors`
+/// as its Client Monitor Data, or no such block when `None`. Returns the PDU's `pduSource` and the monitors it lists.
+fn monitor_layout_sent(monitors: Option<Vec<Monitor>>) -> (u16, Vec<Monitor>) {
     let mut acceptor = multitransport_acceptor(None);
     let mut client_blocks = client_gcc_with_message_channel_and_multitransport(None);
     client_blocks
@@ -2160,6 +2466,7 @@ fn monitor_layout_pdu_source_is_zero() {
         .early_capability_flags
         .get_or_insert_with(ClientEarlyCapabilityFlags::empty)
         .insert(ClientEarlyCapabilityFlags::SUPPORT_MONITOR_LAYOUT_PDU);
+    client_blocks.monitor = monitors.map(|monitors| ClientMonitorData { monitors });
     drive_to_secure_settings_exchange(&mut acceptor, client_blocks);
 
     acceptor.step(&[], None, &mut WriteBuf::new()).unwrap(); // LicensingExchange
@@ -2171,13 +2478,241 @@ fn monitor_layout_pdu_source_is_zero() {
     let indication = mcs::decode_send_data_indication(output.filled()).unwrap();
     let share_control = decode_share_control(indication).unwrap();
     let ShareControlPdu::Data(ShareDataHeader {
-        share_data_pdu: ShareDataPdu::MonitorLayout(_),
+        share_data_pdu: ShareDataPdu::MonitorLayout(layout),
         ..
     }) = share_control.pdu
     else {
         panic!("expected a Monitor Layout PDU");
     };
-    assert_eq!(share_control.pdu_source, 0);
+    (share_control.pdu_source, layout.monitors)
+}
+
+// oracle: spec MS-RDPBCGR §2.2.12.1 (the pduSource field of the Monitor Layout PDU MUST be set to zero)
+#[test]
+fn monitor_layout_pdu_source_is_zero() {
+    let (pdu_source, _) = monitor_layout_sent(None);
+    assert_eq!(pdu_source, 0);
+}
+
+/// The single primary monitor spanning the 1920x1080 desktop of [`monitor_layout_sent`].
+const DESKTOP_MONITOR: Monitor = Monitor {
+    left: 0,
+    top: 0,
+    right: 1919,
+    bottom: 1079,
+    flags: MonitorFlags::PRIMARY,
+};
+
+// oracle: reference neutrinolabs/xrdp@5e7deccfe10770d3bef867f819d7a66434faf074:libxrdp/xrdp_caps.c (xrdp_caps_send_monitorlayout lists the client's monitor definitions as received)
+#[test]
+fn monitor_layout_echoes_the_client_monitors() {
+    let monitors = vec![
+        Monitor {
+            left: 0,
+            top: 0,
+            right: 1279,
+            bottom: 1079,
+            flags: MonitorFlags::PRIMARY,
+        },
+        Monitor {
+            left: -640,
+            top: 0,
+            right: -1,
+            bottom: 719,
+            flags: MonitorFlags::empty(),
+        },
+    ];
+
+    assert_eq!(monitor_layout_sent(Some(monitors.clone())).1, monitors);
+}
+
+// oracle: spec MS-RDPBCGR §2.2.1.3.6.1 (the primary monitor's upper-left corner is (0, 0); right and bottom are inclusive)
+#[test]
+fn monitor_layout_without_client_monitors_is_the_desktop() {
+    assert_eq!(monitor_layout_sent(None).1, [DESKTOP_MONITOR]);
+}
+
+/// Sends `monitors`, which do not describe the 1920x1080 session, and checks that the Monitor Layout PDU does not list
+/// them.
+fn assert_layout_not_echoed(monitors: Vec<Monitor>) {
+    let sent = monitor_layout_sent(Some(monitors.clone())).1;
+    assert_ne!(sent, monitors);
+    // oracle: mutant a fallback other than the single primary monitor spanning the desktop, such as an empty list
+    assert_eq!(sent, [DESKTOP_MONITOR]);
+}
+
+/// A 960x1080 monitor starting at `left`: a half of the 1920x1080 desktop when `left` is 0 or 960.
+const fn half(left: i32, flags: MonitorFlags) -> Monitor {
+    Monitor {
+        left,
+        top: 0,
+        right: left + 959,
+        bottom: 1079,
+        flags,
+    }
+}
+
+// oracle: spec MS-RDPBCGR §2.2.1.3.6.1 (monitor positions are relative to the primary monitor, so a layout without one describes no session)
+#[test]
+fn monitor_layout_ignores_client_monitors_without_a_primary() {
+    assert_layout_not_echoed(vec![half(0, MonitorFlags::empty()), half(960, MonitorFlags::empty())]);
+}
+
+// oracle: spec MS-RDPBCGR §2.2.1.3.6.1 (monitor positions are relative to the one monitor designated the primary)
+#[test]
+fn monitor_layout_ignores_client_monitors_with_two_primaries() {
+    assert_layout_not_echoed(vec![DESKTOP_MONITOR, DESKTOP_MONITOR]);
+}
+
+// oracle: spec MS-RDPBCGR §2.2.1.3.6.1 (the upper-left corner of the primary monitor is always (0, 0))
+#[test]
+fn monitor_layout_ignores_client_monitors_whose_primary_is_not_at_the_origin() {
+    assert_layout_not_echoed(vec![half(0, MonitorFlags::empty()), half(960, MonitorFlags::PRIMARY)]);
+}
+
+// oracle: spec MS-RDPBCGR §2.2.1.3.6.1 (the upper-left corner of the primary monitor is always (0, 0), so a layout lists a primary)
+#[test]
+fn monitor_layout_ignores_client_monitor_data_without_monitors() {
+    assert_layout_not_echoed(Vec::new());
+}
+
+// oracle: spec MS-RDPBCGR §2.2.1.3.6.1 (right is the inclusive lower-right corner, so a monitor ending left of where it starts has no pixels)
+#[test]
+fn monitor_layout_ignores_client_monitors_with_a_monitor_inverted_horizontally() {
+    assert_layout_not_echoed(vec![
+        DESKTOP_MONITOR,
+        Monitor {
+            left: 1920,
+            top: 0,
+            right: 1919,
+            bottom: 1079,
+            flags: MonitorFlags::empty(),
+        },
+    ]);
+}
+
+// oracle: spec MS-RDPBCGR §2.2.1.3.6.1 (bottom is the inclusive lower-right corner, so a monitor ending above where it starts has no pixels)
+#[test]
+fn monitor_layout_ignores_client_monitors_with_a_monitor_inverted_vertically() {
+    assert_layout_not_echoed(vec![
+        DESKTOP_MONITOR,
+        Monitor {
+            left: 0,
+            top: 1080,
+            right: 1919,
+            bottom: 1079,
+            flags: MonitorFlags::empty(),
+        },
+    ]);
+}
+
+// oracle: spec MS-RDPBCGR §2.2.12.1 (the monitorDefArray describes the monitor layout of the session, whose desktop is 1920x1080 here)
+#[test]
+fn monitor_layout_ignores_client_monitors_that_do_not_span_the_desktop() {
+    assert_layout_not_echoed(vec![Monitor {
+        left: 0,
+        top: 0,
+        right: 2559,
+        bottom: 1439,
+        flags: MonitorFlags::PRIMARY,
+    }]);
+}
+
+// oracle: spec MS-RDPBCGR §2.2.12.1 (the monitorDefArray describes the monitor layout of the session, whose desktop is 1920x1080 here, while these monitors span 2560 pixels from x = -640)
+#[test]
+fn monitor_layout_ignores_client_monitors_left_of_the_primary_that_do_not_span_the_desktop() {
+    assert_layout_not_echoed(vec![
+        DESKTOP_MONITOR,
+        Monitor {
+            left: -640,
+            top: 0,
+            right: -1,
+            bottom: 719,
+            flags: MonitorFlags::empty(),
+        },
+    ]);
+}
+
+/// Offers the size it was built with and records what the acceptor showed it.
+struct DesktopChooser {
+    chosen: DesktopSize,
+    client_monitors: Option<Vec<Monitor>>,
+    prepared_size: Option<DesktopSize>,
+}
+
+#[async_trait::async_trait(?Send)]
+impl ConnectionSetupHandler for DesktopChooser {
+    async fn handle_credentials(&mut self, _: Option<ReceivedCredentials>) -> ConnectorResult<()> {
+        Ok(())
+    }
+
+    async fn choose_desktop_size(&mut self, client_monitors: &[Monitor], _: DesktopSize) -> DesktopSize {
+        self.client_monitors = Some(client_monitors.to_vec());
+        self.chosen
+    }
+
+    async fn prepare_capability_exchange(&mut self, desktop_size: DesktopSize) -> ConnectorResult<()> {
+        self.prepared_size = Some(desktop_size);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_desktop_size_chosen_for_the_client_monitors_is_offered_with_them() {
+    let monitors = vec![
+        Monitor {
+            left: 0,
+            top: 0,
+            right: 1279,
+            bottom: 719,
+            flags: MonitorFlags::PRIMARY,
+        },
+        Monitor {
+            left: 1280,
+            top: 0,
+            right: 2559,
+            bottom: 719,
+            flags: MonitorFlags::empty(),
+        },
+    ];
+    let their_box = DesktopSize {
+        width: 2560,
+        height: 720,
+    };
+    let mut acceptor = negotiated_acceptor(SecurityProtocol::SSL);
+    let mut handler = DesktopChooser {
+        chosen: their_box,
+        client_monitors: None,
+        prepared_size: None,
+    };
+    let framed = Framed::<HandshakeStream>::new(HandshakeStream {
+        incoming: post_credssp_messages_with_monitors(
+            Some(ClientEarlyCapabilityFlags::SUPPORT_MONITOR_LAYOUT_PDU),
+            Some(monitors.clone()),
+        ),
+        ..HandshakeStream::default()
+    });
+    let outgoing = Rc::clone(&framed.get_inner().0.outgoing);
+
+    // The client sends no Confirm Active, so the handshake stops after the Monitor Layout PDU.
+    let _ = accept_finalize_with(framed, &mut acceptor, &mut handler).await;
+
+    // oracle: spec MS-RDPBCGR §2.2.1.3.6 (the Client Monitor Data the client sent)
+    assert_eq!(handler.client_monitors.as_ref(), Some(&monitors));
+    // oracle: mutant the chosen size not reaching the capability setup that binds the display at it
+    assert_eq!(handler.prepared_size, Some(their_box));
+    let layout = outgoing.borrow().iter().find_map(|bytes| {
+        let indication = mcs::decode_send_data_indication(bytes).ok()?;
+        match decode_share_control(indication).ok()?.pdu {
+            ShareControlPdu::Data(ShareDataHeader {
+                share_data_pdu: ShareDataPdu::MonitorLayout(layout),
+                ..
+            }) => Some(layout.monitors),
+            _ => None,
+        }
+    });
+    // oracle: reference neutrinolabs/xrdp@5e7deccfe10770d3bef867f819d7a66434faf074:libxrdp/xrdp_caps.c (xrdp_caps_send_monitorlayout lists the client's monitor definitions as received)
+    assert_eq!(layout, Some(monitors));
 }
 
 async fn accept_spnego_credssp(
@@ -2185,7 +2720,15 @@ async fn accept_spnego_credssp(
     username: &str,
     password: &str,
 ) -> (ConnectorResult<()>, SetupHandler, Vec<Vec<u8>>) {
-    let mut acceptor = negotiated_acceptor(protocol);
+    run_spnego_credssp(&mut negotiated_acceptor(protocol), username, password).await
+}
+
+/// Runs CredSSP for an SPNEGO client as `username`/`password` against `acceptor`.
+async fn run_spnego_credssp(
+    acceptor: &mut Acceptor,
+    username: &str,
+    password: &str,
+) -> (ConnectorResult<()>, SetupHandler, Vec<Vec<u8>>) {
     let public_key = vec![0x42; 32];
     let mut client = spnego_credssp_client(username, password, &public_key);
     let first_message = spnego_credssp_message(&mut client, TsRequest::default());
@@ -2198,7 +2741,7 @@ async fn accept_spnego_credssp(
     let mut handler = SetupHandler::default();
     let result = accept_credssp_with(
         &mut framed,
-        &mut acceptor,
+        acceptor,
         &mut NoNetwork,
         "client.example.com".to_owned().into(),
         public_key,
@@ -2295,6 +2838,150 @@ async fn credssp_failed_spnego_logon_is_reported_as_logon_failure(#[case] userna
     assert!(handler.received.is_empty());
     let ts_request = TsRequest::from_buffer(outgoing.last().unwrap()).unwrap();
     assert_eq!(ts_request.error_code, Some(NStatusCode::LOGON_FAILURE));
+}
+
+/// The users CredSSP checks clients against, each with the NT hash of its password.
+const CREDSSP_USERS: [(&str, &str); 2] = [
+    ("anna", "37c40f9603acae8515078ec016e9c02d"), // anna-rd-pass
+    ("bert", "f84632917e3135b981715bccce7ea839"), // bert-rd-pass
+];
+
+fn credssp_users() -> Vec<CredsspAuthIdentity> {
+    CREDSSP_USERS
+        .iter()
+        .map(|(user, hash)| CredsspAuthIdentity {
+            username: Username::new(user, None).unwrap(),
+            password: format!("{NTLM_HASH_PREFIX}{hash}").into(),
+        })
+        .collect()
+}
+
+/// A HYBRID acceptor past the security upgrade with no fixed identity, checking CredSSP against [`CREDSSP_USERS`].
+fn acceptor_with_credssp_users() -> Acceptor {
+    let mut acceptor = negotiated_acceptor_expecting(SecurityProtocol::HYBRID, None);
+    acceptor.set_credssp_users(credssp_users());
+    acceptor
+}
+
+/// Runs CredSSP for a bare NTLM client as `username`/`password` against [`acceptor_with_credssp_users`].
+/// Returns the result, the acceptor and the frames it wrote.
+async fn accept_credssp_from_user_list(
+    username: &str,
+    password: &str,
+) -> (ConnectorResult<()>, Acceptor, Vec<Vec<u8>>) {
+    let mut acceptor = acceptor_with_credssp_users();
+    let public_key = vec![0x42; 32];
+    let (mut client, request) = CredsspSequence::init(
+        ironrdp_connector::Credentials::UsernamePassword {
+            username: username.to_owned(),
+            password: password.to_owned(),
+        },
+        None,
+        SecurityProtocol::HYBRID,
+        "server.example.com".to_owned().into(),
+        public_key.clone(),
+        None,
+    )
+    .unwrap();
+    let mut framed = Framed::<HandshakeStream>::new(HandshakeStream {
+        incoming: [client_credssp_message(&mut client, request)].into(),
+        credssp_client: Some(client),
+        ..HandshakeStream::default()
+    });
+    let outgoing = Rc::clone(&framed.get_inner().0.outgoing);
+    let result = accept_credssp_with(
+        &mut framed,
+        &mut acceptor,
+        &mut NoNetwork,
+        "client.example.com".to_owned().into(),
+        public_key,
+        None,
+        &mut SetupHandler::default(),
+    )
+    .await;
+    let outgoing = outgoing.borrow().clone();
+    (result, acceptor, outgoing)
+}
+
+#[tokio::test]
+async fn credssp_finds_each_users_hash_in_the_list() {
+    let (result, acceptor, _) = accept_credssp_from_user_list("bert", "bert-rd-pass").await;
+
+    result.unwrap();
+    let received = acceptor.received_credentials().expect("CredSSP delegates the password");
+    assert_eq!(received.origin, ironrdp_acceptor::CredentialOrigin::CredSspDelegated);
+    assert_eq!(received.credentials.username, "bert");
+    assert_eq!(received.credentials.domain, None);
+    assert_eq!(received.credentials.password, "bert-rd-pass");
+}
+
+#[rstest::rstest]
+#[case::down_level("DOMAIN\\bert", "bert", Some("DOMAIN"))]
+#[case::upn("bert@host", "bert@host", None)]
+#[tokio::test]
+async fn credssp_bare_ntlm_matches_a_listed_user_by_account_name_whatever_the_domain(
+    #[case] sent: &str,
+    #[case] username: &str,
+    #[case] domain: Option<&str>,
+) {
+    let (result, acceptor, _) = accept_credssp_from_user_list(sent, "bert-rd-pass").await;
+
+    result.unwrap();
+    let received = acceptor.received_credentials().expect("CredSSP delegates the password");
+    assert_eq!(received.origin, ironrdp_acceptor::CredentialOrigin::CredSspDelegated);
+    assert_eq!(received.credentials.username, username);
+    assert_eq!(received.credentials.domain.as_deref(), domain);
+    assert_eq!(received.credentials.password, "bert-rd-pass");
+}
+
+#[tokio::test]
+async fn credssp_refuses_a_user_the_list_does_not_hold() {
+    let (result, acceptor, outgoing) = accept_credssp_from_user_list("carl", "carl-rd-pass").await;
+
+    assert!(result.is_err(), "an unknown user fails CredSSP");
+    assert!(acceptor.received_credentials().is_none());
+    let ts_request = TsRequest::from_buffer(outgoing.last().unwrap()).unwrap();
+    assert_eq!(ts_request.error_code, Some(NStatusCode::LOGON_FAILURE));
+}
+
+#[tokio::test]
+async fn credssp_refuses_a_wrong_password_for_a_listed_user() {
+    let (result, acceptor, outgoing) = accept_credssp_from_user_list("anna", "bert-rd-pass").await;
+
+    assert!(result.is_err(), "anna's hash does not accept bert's password");
+    assert!(acceptor.received_credentials().is_none());
+    let ts_request = TsRequest::from_buffer(outgoing.last().unwrap()).unwrap();
+    assert_eq!(ts_request.error_code, Some(NStatusCode::LOGON_FAILURE));
+}
+
+#[rstest::rstest]
+#[case::accepted("bert", "bert-rd-pass", true)]
+#[case::refused("carl", "carl-rd-pass", false)]
+#[tokio::test]
+async fn credssp_drops_the_user_list_when_it_ends(
+    #[case] username: &str,
+    #[case] password: &str,
+    #[case] accepted: bool,
+) {
+    let (result, acceptor, _) = accept_credssp_from_user_list(username, password).await;
+
+    assert_eq!(result.is_ok(), accepted);
+    assert!(
+        !acceptor.__test_holds_credssp_users(),
+        "the acceptor holds no user list after CredSSP"
+    );
+}
+
+#[tokio::test]
+async fn credssp_spnego_client_finds_its_user_in_the_list() {
+    let mut acceptor = acceptor_with_credssp_users();
+    let (result, _, _) = run_spnego_credssp(&mut acceptor, "bert", "bert-rd-pass").await;
+
+    result.unwrap();
+    let received = acceptor.received_credentials().expect("CredSSP delegates the password");
+    assert_eq!(received.origin, ironrdp_acceptor::CredentialOrigin::CredSspDelegated);
+    assert_eq!(received.credentials.username, "bert");
+    assert_eq!(received.credentials.password, "bert-rd-pass");
 }
 
 #[cfg(windows)]
@@ -2472,7 +3159,7 @@ async fn native_credssp_delegates_authenticated_local_credentials() {
         ironrdp_acceptor::CredentialOrigin::CredSspDelegated
     );
     let expected = Username::parse(&username).unwrap();
-    let ironrdp_connector::sspi::UsernameParts::DownLevelLogonName(parts) = expected.parts() else {
+    let sspi::UsernameParts::DownLevelLogonName(parts) = expected.parts() else {
         panic!("the fixture must use a local account");
     };
     assert_eq!(handler.received[0].credentials.username, parts.account_name());

@@ -2672,6 +2672,8 @@ dependencies = [
  "ironrdp-core 0.3.1",
  "ironrdp-pdu",
  "ironrdp-svc",
+ "picky-asn1-der",
+ "picky-krb",
  "rand 0.9.5",
  "sha2 0.10.9",
  "tracing",
@@ -3228,6 +3230,7 @@ dependencies = [
  "sha1 0.11.0",
  "tap",
  "x509-cert",
+ "zeroize",
 ]
 
 [[package]]
@@ -3714,6 +3717,7 @@ dependencies = [
  "expect-test",
  "hex",
  "ironrdp-acceptor",
+ "ironrdp-ainput",
  "ironrdp-async",
  "ironrdp-bulk",
  "ironrdp-cfg",

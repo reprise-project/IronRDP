@@ -2776,6 +2776,76 @@ async fn connect_active_client(
     (active_stage, activation_factory, upgraded_framed)
 }
 
+/// A validator that counts its checks and refuses every one.
+struct CountingRefusal(Arc<AtomicUsize>);
+
+#[async_trait::async_trait]
+impl server::CredentialValidator for CountingRefusal {
+    async fn validate(
+        &self,
+        _: &server::Credentials,
+    ) -> Result<server::CredentialDecision, server::CredentialValidationError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(server::CredentialDecision::Reject)
+    }
+}
+
+/// A server that never issued a cookie can't match an auto-reconnect packet, so the packet
+/// must not defer the Client Info credential check to activation.
+#[tokio::test]
+async fn an_auto_reconnect_packet_to_a_server_without_a_cookie_has_its_credentials_checked() {
+    let cert_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs/server-cert.pem");
+    let key_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs/server-key.pem");
+    let identity = TlsIdentityCtx::init_from_paths(&cert_path, &key_path).expect("failed to init TLS identity");
+    let checks = Arc::new(AtomicUsize::new(0));
+    let (_display_tx, display_rx) = mpsc::unbounded_channel();
+    let mut server = RdpServer::builder()
+        .with_addr(([127, 0, 0, 1], 0))
+        .with_tls(identity.make_acceptor().expect("failed to build TLS acceptor"))
+        .with_input_handler(TestInputHandler)
+        .with_display_handler(TestDisplay {
+            rx: Arc::new(Mutex::new(display_rx)),
+            offers_display_control: false,
+        })
+        .with_credential_validator(Some(Arc::new(CountingRefusal(Arc::clone(&checks)))))
+        .build();
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind listener");
+    let server_addr = listener.local_addr().expect("listener address");
+
+    let local = tokio::task::LocalSet::new();
+    let connected = local
+        .run_until(async move {
+            let server = tokio::task::spawn_local(async move {
+                let (stream, _) = listener.accept().await.expect("accept connection");
+                let _ = Box::pin(server.run_connection(stream)).await;
+            });
+            let client = tokio::task::spawn_local(async move {
+                let cookie = ServerAutoReconnect {
+                    logon_id: 1,
+                    random_bits: [0x5a; 16],
+                };
+                let mut config = default_client_config();
+                config.enable_credssp = false;
+                connect_client_with(
+                    server_addr,
+                    |client_addr| {
+                        connector::ClientConnector::new(config, client_addr).with_auto_reconnect_cookie(cookie)
+                    },
+                    |stream| stream,
+                )
+                .await
+                .is_ok()
+            });
+            let (server, client) = tokio::join!(server, client);
+            server.expect("server task");
+            client.expect("client task")
+        })
+        .await;
+
+    assert!(!connected, "the refused login does not connect");
+    assert_eq!(checks.load(Ordering::SeqCst), 1, "the credentials were checked");
+}
+
 /// A server that holds an auto-reconnect cookie and whose cookies are issued on request or at
 /// activation, with the channel that feeds its display.
 fn auto_reconnect_server(on_request: bool) -> (RdpServer, UnboundedSender<DisplayUpdate>) {
@@ -3743,6 +3813,84 @@ async fn client_session_config_reports_honored_desktop_size(
         panic!("missing session configuration callback");
     };
     assert_eq!(config.desktop_size, Some((expected_width, expected_height)));
+}
+
+/// Offers the bounding box of two or more client monitors.
+struct MonitorBox;
+
+impl server::ConnectionHandler for MonitorBox {
+    fn choose_desktop_size(&mut self, client_monitors: &[gcc::Monitor], desktop_size: DesktopSize) -> DesktopSize {
+        if client_monitors.len() < 2 {
+            return desktop_size;
+        }
+        let span = |start: fn(&gcc::Monitor) -> i32, end: fn(&gcc::Monitor) -> i32| {
+            let first = client_monitors.iter().map(start).min().unwrap_or_default();
+            let last = client_monitors.iter().map(end).max().unwrap_or_default();
+            u16::try_from(last - first + 1).unwrap()
+        };
+        DesktopSize {
+            width: span(|m| m.left, |m| m.right),
+            height: span(|m| m.top, |m| m.bottom),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_client_with_two_monitors_is_offered_the_size_chosen_for_them() {
+    let monitors = vec![
+        gcc::Monitor {
+            left: 0,
+            top: 0,
+            right: 1279,
+            bottom: 719,
+            flags: gcc::MonitorFlags::PRIMARY,
+        },
+        gcc::Monitor {
+            left: 1280,
+            top: 0,
+            right: 2559,
+            bottom: 719,
+            flags: gcc::MonitorFlags::empty(),
+        },
+    ];
+    let (mut server, _display_tx) =
+        handler_server_with_desktop_limit(Box::new(MonitorBox), server::ConnectionPolicy::Queue, None);
+    let ev = server.event_sender().clone();
+
+    let local = tokio::task::LocalSet::new();
+    let result = local
+        .run_until(async {
+            let server_task = tokio::task::spawn_local(async move {
+                let _ = server.run().await;
+            });
+            let server_addr = local_addr_of(&ev).await;
+            let (_client, result) = connect_client(server_addr, |client_addr| {
+                let mut config = default_client_config();
+                config.desktop_size = DesktopSize {
+                    width: 2560,
+                    height: 720,
+                };
+                config.monitor_layout = Some(gcc::ClientMonitorData {
+                    monitors: monitors.clone(),
+                });
+                connector::ClientConnector::new(config, client_addr)
+            })
+            .await;
+            server_task.abort();
+            result
+        })
+        .await;
+
+    // oracle: mutant the size the connection handler chose not reaching the Demand Active PDU, which offers 1024x768
+    assert_eq!(
+        result.desktop_size,
+        DesktopSize {
+            width: 2560,
+            height: 720
+        }
+    );
+    // oracle: reference neutrinolabs/xrdp@5e7deccfe10770d3bef867f819d7a66434faf074:libxrdp/xrdp_caps.c (xrdp_caps_send_monitorlayout lists the client's monitor definitions as received)
+    assert_eq!(result.monitor_layout.map(|layout| layout.monitors), Some(monitors));
 }
 
 fn assert_handler_cause(error: connector::ConnectorError) {

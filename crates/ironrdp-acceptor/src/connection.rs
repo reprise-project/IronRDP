@@ -23,6 +23,7 @@ use tracing::{debug, warn};
 
 use super::channel_connection::ChannelConnectionSequence;
 use super::finalization::{FinalizationSequence, InputEventBuffer};
+use crate::ReplayStep;
 use crate::util::{self, wrap_share_data};
 
 const IO_CHANNEL_ID: u16 = 1003;
@@ -36,6 +37,33 @@ const USER_CHANNEL_ID: u16 = 1002;
 struct CredentialIdentity<'a> {
     username: &'a str,
     domain: Option<&'a str>,
+}
+
+/// Whether `monitors` can stand as the session's layout in the Monitor Layout PDU: 1 to 16 monitors
+/// (MS-RDPBCGR 2.2.1.3.6), each at least one pixel wide and high, exactly one of them primary and that one at (0, 0)
+/// (2.2.1.3.6.1), and together spanning exactly `desktop`.
+fn is_session_layout(monitors: &[gcc::Monitor], desktop: DesktopSize) -> bool {
+    let mut primaries = monitors.iter().filter(|m| m.flags.contains(gcc::MonitorFlags::PRIMARY));
+    let one_primary_at_origin = matches!(
+        (primaries.next(), primaries.next()),
+        (Some(primary), None) if primary.left == 0 && primary.top == 0
+    );
+    // UNTESTED: the upper bound keeps the Monitor Layout PDU within the 16 monitors MS-RDPBCGR 2.2.1.3.6 allows. The
+    // Client Monitor Data decoder already refuses more, so no public input reaches it; check it when that decoder changes.
+    if !(1..=gcc::MONITOR_COUNT_MAX).contains(&monitors.len())
+        || monitors.iter().any(|m| m.right < m.left || m.bottom < m.top)
+        || !one_primary_at_origin
+    {
+        return false;
+    }
+
+    let span = |start: fn(&gcc::Monitor) -> i32, end: fn(&gcc::Monitor) -> i32| {
+        let first = monitors.iter().map(start).min().unwrap_or_default();
+        let last = monitors.iter().map(end).max().unwrap_or_default();
+        i64::from(last) - i64::from(first) + 1
+    };
+    span(|m| m.left, |m| m.right) == i64::from(desktop.width)
+        && span(|m| m.top, |m| m.bottom) == i64::from(desktop.height)
 }
 
 fn split_down_level_logon_name(s: &str) -> Option<(&str, &str)> {
@@ -124,6 +152,8 @@ pub struct Acceptor {
     user_channel_id: u16,
     message_channel_id: Option<u16>,
     desktop_size: DesktopSize,
+    client_version: gcc::RdpVersion,
+    client_build: u32,
     keyboard_layout: u32,
     keyboard_type: gcc::KeyboardType,
     keyboard_subtype: u32,
@@ -139,6 +169,7 @@ pub struct Acceptor {
     multitransport_flags: Option<gcc::MultiTransportFlags>,
     early_capability_flags: gcc::ClientEarlyCapabilityFlags,
     client_monitors: Vec<gcc::Monitor>,
+    client_monitors_ex: Vec<gcc::ExtendedMonitorInfo>,
     routing_token: Option<String>,
     client_cluster_data: Option<gcc::ClientClusterData>,
     password_cookie: Option<PasswordCookie>,
@@ -151,9 +182,11 @@ pub struct Acceptor {
     saved_for_reactivation: AcceptorState,
     pub(crate) creds: Option<Credentials>,
     pub(crate) credssp_backend: crate::CredsspBackend,
+    pub(crate) credssp_users: Option<Vec<AuthIdentity>>,
     received_credentials: Option<ReceivedCredentials>,
     credentials_handled: bool,
     received_auto_reconnect: Option<ClientAutoReconnect>,
+    accept_auto_reconnect: bool,
     allow_unverified_credentials: bool,
     reactivation: bool,
     honor_client_desktop_size: Option<DesktopSize>,
@@ -332,6 +365,10 @@ pub struct AcceptorResult {
     /// channel. `None` when the client did not request it.
     pub message_channel_id: Option<u16>,
     pub reactivation: bool,
+    /// RDP protocol version announced by the client in its GCC Client Core Data (section 2.2.1.3.2, `version`).
+    pub client_version: gcc::RdpVersion,
+    /// Build number announced by the client in its GCC Client Core Data (section 2.2.1.3.2, `clientBuild`).
+    pub client_build: u32,
     /// Keyboard layout identifier (KLID) announced by the client in its GCC
     /// Client Core Data (section 2.2.1.3.2, `keyboardLayout`).
     ///
@@ -400,12 +437,19 @@ pub struct AcceptorResult {
     /// single monitor commonly does not. Servers that can present a variable
     /// number of outputs use it to present as many as the client has.
     ///
-    /// This is the client's layout, in the client's coordinates. It does not
-    /// change what the acceptor announces back: the Monitor Layout PDU
-    /// (section 2.2.12.1, sent when the client supports it) describes the
-    /// server's session and still lists one monitor spanning the desktop size,
-    /// whatever the server presents.
+    /// This is the client's layout, in the client's coordinates. When it holds
+    /// 1 to 16 monitors of non-zero size, exactly one primary, that together
+    /// span the desktop size, the Monitor Layout PDU (section 2.2.12.1, sent
+    /// when the client supports it) lists these monitors unchanged; otherwise
+    /// it lists one primary monitor spanning the desktop size.
     pub client_monitors: Vec<gcc::Monitor>,
+    /// The extended attributes of the client's monitors from its GCC Client
+    /// Monitor Extended Data (section 2.2.1.3.9): physical size, orientation
+    /// and scale factors, in the order it sent them, which matches
+    /// `client_monitors`.
+    ///
+    /// Empty when the client did not send the block.
+    pub client_monitors_ex: Vec<gcc::ExtendedMonitorInfo>,
     /// Multitransport (MS-RDPEMT) capability flags announced by the client in
     /// its GCC `MultiTransportChannelData` block (section 2.2.1.3.8).
     ///
@@ -474,6 +518,8 @@ impl Acceptor {
             io_channel_id: IO_CHANNEL_ID,
             message_channel_id: None,
             desktop_size,
+            client_version: gcc::RdpVersion(0),
+            client_build: 0,
             keyboard_layout: 0,
             keyboard_type: gcc::KeyboardType(0),
             keyboard_subtype: 0,
@@ -484,6 +530,7 @@ impl Acceptor {
             multitransport_flags: None,
             early_capability_flags: gcc::ClientEarlyCapabilityFlags::empty(),
             client_monitors: Vec::new(),
+            client_monitors_ex: Vec::new(),
             routing_token: None,
             client_cluster_data: None,
             password_cookie: None,
@@ -496,9 +543,11 @@ impl Acceptor {
             saved_for_reactivation: Default::default(),
             creds,
             credssp_backend: crate::CredsspBackend::default(),
+            credssp_users: None,
             received_credentials: None,
             credentials_handled: false,
             received_auto_reconnect: None,
+            accept_auto_reconnect: true,
             allow_unverified_credentials: false,
             reactivation: false,
             honor_client_desktop_size: None,
@@ -561,9 +610,30 @@ impl Acceptor {
         self.honor_client_desktop_size = max;
     }
 
+    /// Whether a Client Auto-Reconnect Packet in Client Info is taken as an auto-reconnect attempt, which defers the
+    /// credential check to the server's cookie check.
+    /// A server that holds no cookie turns this off, so such a packet is ignored and the Client Info credentials are
+    /// checked as for any login.
+    /// On by default.
+    pub fn set_accept_auto_reconnect(&mut self, accept: bool) {
+        self.accept_auto_reconnect = accept;
+    }
+
     /// Selects the CredSSP authentication provider before negotiation begins.
     pub fn set_credssp_backend(&mut self, backend: crate::CredsspBackend) {
         self.credssp_backend = backend;
+    }
+
+    /// Checks CredSSP against `users`, not `new`'s creds, and drops them when it ends. Passwords may be `$NTLM$:<hex>`.
+    /// Bare NTLM ignores the client's domain; SPNEGO needs an entry with the client's exact user and domain form.
+    pub fn set_credssp_users(&mut self, users: Vec<AuthIdentity>) {
+        self.credssp_users = Some(users);
+    }
+
+    #[cfg(feature = "__test")]
+    #[doc(hidden)]
+    pub fn __test_holds_credssp_users(&self) -> bool {
+        self.credssp_users.is_some()
     }
 
     /// Allows ClientInfo credentials to be validated by an external logon provider.
@@ -734,6 +804,8 @@ impl Acceptor {
             io_channel_id: consumed.io_channel_id,
             message_channel_id: consumed.message_channel_id,
             desktop_size,
+            client_version: consumed.client_version,
+            client_build: consumed.client_build,
             keyboard_layout: consumed.keyboard_layout,
             keyboard_type: consumed.keyboard_type,
             keyboard_subtype: consumed.keyboard_subtype,
@@ -744,6 +816,7 @@ impl Acceptor {
             multitransport_flags: consumed.multitransport_flags,
             early_capability_flags: consumed.early_capability_flags,
             client_monitors: consumed.client_monitors,
+            client_monitors_ex: consumed.client_monitors_ex,
             routing_token: consumed.routing_token,
             client_cluster_data: consumed.client_cluster_data,
             password_cookie: consumed.password_cookie,
@@ -756,9 +829,11 @@ impl Acceptor {
             saved_for_reactivation,
             creds: consumed.creds,
             credssp_backend: consumed.credssp_backend,
+            credssp_users: None,
             received_credentials: consumed.received_credentials,
             credentials_handled: consumed.credentials_handled,
             received_auto_reconnect: consumed.received_auto_reconnect,
+            accept_auto_reconnect: consumed.accept_auto_reconnect,
             allow_unverified_credentials: consumed.allow_unverified_credentials,
             reactivation: true,
             honor_client_desktop_size: consumed.honor_client_desktop_size,
@@ -829,8 +904,25 @@ impl Acceptor {
         matches!(self.state, AcceptorState::Credssp { .. })
     }
 
+    /// Whether the acceptor waits at Licensing, where a recorded accept ends.
+    pub fn is_licensing(&self) -> bool {
+        matches!(self.state, AcceptorState::LicensingExchange { .. })
+    }
+
     pub(crate) fn desktop_size(&self) -> DesktopSize {
         self.desktop_size
+    }
+
+    /// Offers `size` in the Demand Active PDU and the Monitor Layout PDU that follows it.
+    ///
+    /// Takes effect only before the acceptor leaves [`AcceptorState::CapabilitiesSendServer`].
+    pub(crate) fn offer_desktop_size(&mut self, size: DesktopSize) {
+        self.desktop_size = size;
+        set_bitmap_desktop_size(&mut self.server_capabilities, size);
+    }
+
+    pub(crate) fn client_monitors(&self) -> &[gcc::Monitor] {
+        &self.client_monitors
     }
 
     pub(crate) fn is_reactivation(&self) -> bool {
@@ -896,7 +988,7 @@ impl Acceptor {
 
     /// Whether credentials need handling after channel joins and ClientInfo.
     pub(crate) fn credentials_need_handling(&self) -> bool {
-        matches!(self.state, AcceptorState::LicensingExchange { .. })
+        self.is_licensing()
             && !self.is_auto_reconnect_attempt()
             && self.received_credentials.is_some()
             && !self.credentials_handled
@@ -969,6 +1061,25 @@ impl Acceptor {
         assert_eq!(res, Written::Nothing);
     }
 
+    /// Brings a fresh acceptor to the state another acceptor reached through `steps`.
+    ///
+    /// Fails at the first step whose reply differs from the recorded one, or whose marker does not fit the state.
+    pub fn replay(&mut self, steps: &[ReplayStep]) -> ConnectorResult<()> {
+        crate::replay::replay(self, steps)
+    }
+
+    /// As [`Self::mark_credssp_as_done`], for a CredSSP exchange run elsewhere: `credentials` become
+    /// [`Self::received_credentials`], which the HYBRID Client Info step leaves in place.
+    ///
+    /// # Panics
+    ///
+    /// Panics if state is not [AcceptorState::Credssp].
+    pub fn mark_credssp_as_done_with(&mut self, credentials: ReceivedCredentials) {
+        self.mark_credssp_as_done();
+        self.received_credentials = Some(credentials);
+        self.credentials_handled = false;
+    }
+
     pub fn get_result(&mut self) -> Option<AcceptorResult> {
         match mem::take(&mut self.state) {
             AcceptorState::Accepted {
@@ -982,6 +1093,8 @@ impl Acceptor {
                 user_channel_id: self.user_channel_id,
                 io_channel_id: self.io_channel_id,
                 message_channel_id: self.message_channel_id,
+                client_version: self.client_version,
+                client_build: self.client_build,
                 keyboard_layout: self.keyboard_layout,
                 keyboard_type: self.keyboard_type,
                 keyboard_subtype: self.keyboard_subtype,
@@ -996,6 +1109,7 @@ impl Acceptor {
                 multitransport_response_success: self.received_multitransport_response,
                 client_early_capability_flags: self.early_capability_flags,
                 client_monitors: self.client_monitors.clone(),
+                client_monitors_ex: self.client_monitors_ex.clone(),
                 reactivation: self.reactivation,
                 credentials: self.credentials_for_result(),
                 auto_reconnect: self.received_auto_reconnect.take(),
@@ -1309,7 +1423,12 @@ impl Sequence for Acceptor {
                 self.early_capability_flags = early_capability.unwrap_or(gcc::ClientEarlyCapabilityFlags::empty());
                 let client_wants_message_channel = gcc_blocks.message_channel.is_some();
                 self.client_monitors = gcc_blocks.monitor.map_or_else(Vec::new, |data| data.monitors);
+                self.client_monitors_ex = gcc_blocks
+                    .monitor_extended
+                    .map_or_else(Vec::new, |data| data.extended_monitors_info);
                 self.client_cluster_data.clone_from(&gcc_blocks.cluster);
+                self.client_version = gcc_blocks.core.version;
+                self.client_build = gcc_blocks.core.client_build;
                 self.keyboard_layout = gcc_blocks.core.keyboard_layout;
                 self.keyboard_type = gcc_blocks.core.keyboard_type;
                 self.keyboard_subtype = gcc_blocks.core.keyboard_subtype;
@@ -1524,11 +1643,11 @@ impl Sequence for Acceptor {
                     .cloned();
                 debug!(
                     has_auto_reconnect = auto_reconnect.is_some(),
+                    accept_auto_reconnect = self.accept_auto_reconnect,
                     "Received Client Info PDU"
                 );
-                self.received_auto_reconnect = auto_reconnect;
-                self.password_cookie
-                    .clone_from(&client_info.client_info.password_cookie);
+                self.received_auto_reconnect = auto_reconnect.filter(|_| self.accept_auto_reconnect);
+                self.password_cookie = client_info.client_info.password_cookie;
 
                 if !protocol.intersects(SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX) {
                     let creds = client_info.client_info.credentials;
@@ -1691,15 +1810,20 @@ impl Sequence for Acceptor {
             }
 
             AcceptorState::MonitorLayoutSend { channels } => {
+                let monitors = if is_session_layout(&self.client_monitors, self.desktop_size) {
+                    self.client_monitors.clone()
+                } else {
+                    vec![gcc::Monitor {
+                        left: 0,
+                        top: 0,
+                        right: i32::from(self.desktop_size.width) - 1,
+                        bottom: i32::from(self.desktop_size.height) - 1,
+                        flags: gcc::MonitorFlags::PRIMARY,
+                    }]
+                };
                 let monitor_layout =
                     rdp::headers::ShareDataPdu::MonitorLayout(rdp::finalization_messages::MonitorLayoutPdu {
-                        monitors: vec![gcc::Monitor {
-                            left: 0,
-                            top: 0,
-                            right: i32::from(self.desktop_size.width) - 1,
-                            bottom: i32::from(self.desktop_size.height) - 1,
-                            flags: gcc::MonitorFlags::PRIMARY,
-                        }],
+                        monitors,
                     });
 
                 debug!(message = ?monitor_layout, "Send");
