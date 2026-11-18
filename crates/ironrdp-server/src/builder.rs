@@ -1,4 +1,5 @@
 use core::net::SocketAddr;
+use core::time::Duration;
 use std::sync::Arc;
 
 use ironrdp_pdu::codecs::rfx::Quant;
@@ -69,6 +70,7 @@ pub struct BuilderDone {
     udp_bind_addr: Option<SocketAddr>,
     max_static_channel_message_size: Option<usize>,
     max_dynamic_channel_message_size: Option<usize>,
+    negotiation_timeout: Option<Duration>,
 }
 
 pub struct RdpServerBuilder<State> {
@@ -188,6 +190,7 @@ impl RdpServerBuilder<WantsDisplay> {
                 udp_bind_addr: None,
                 max_static_channel_message_size: None,
                 max_dynamic_channel_message_size: None,
+                negotiation_timeout: None,
             },
         }
     }
@@ -228,6 +231,7 @@ impl RdpServerBuilder<WantsDisplay> {
                 udp_bind_addr: None,
                 max_static_channel_message_size: None,
                 max_dynamic_channel_message_size: None,
+                negotiation_timeout: None,
             },
         }
     }
@@ -542,6 +546,14 @@ impl RdpServerBuilder<BuilderDone> {
         self
     }
 
+    /// Bounds X.224 negotiation, the TLS handshake and CredSSP of a connection, from its accept, at `timeout`
+    /// instead of 60 s; a connection still negotiating then ends with a `TimedOut` error.
+    /// A preempting candidate keeps its own 10 s bound.
+    pub fn with_negotiation_timeout(mut self, timeout: Duration) -> Self {
+        self.state.negotiation_timeout = Some(timeout);
+        self
+    }
+
     pub fn build(self) -> RdpServer {
         let mut server = RdpServer::new(
             RdpServerOptions {
@@ -557,6 +569,7 @@ impl RdpServerBuilder<BuilderDone> {
                 udp_bind_addr: self.state.udp_bind_addr,
                 max_static_channel_message_size: self.state.max_static_channel_message_size,
                 max_dynamic_channel_message_size: self.state.max_dynamic_channel_message_size,
+                negotiation_timeout: self.state.negotiation_timeout,
             },
             self.state.handler,
             self.state.display,

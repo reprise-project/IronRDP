@@ -89,3 +89,39 @@ async fn silent_client_is_dropped_by_run_connection_handshake() {
         })
         .await;
 }
+
+/// A server built with a negotiation timeout drops a silent client once that timeout, not the default, runs out.
+// oracle: mutant ignoring the builder's timeout (the drop lands at the default 60 s)
+#[tokio::test(start_paused = true)]
+async fn silent_client_is_dropped_after_the_builders_negotiation_timeout() {
+    const TIMEOUT: Duration = Duration::from_secs(90);
+    let mut server = RdpServer::builder()
+        .with_addr(([127, 0, 0, 1], 0))
+        .with_no_security()
+        .with_no_input()
+        .with_no_display()
+        .with_negotiation_timeout(TIMEOUT)
+        .build();
+    let (_client, server_side) = tokio::io::duplex(4096);
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let start = Instant::now();
+            let serving = tokio::task::spawn_local(async move {
+                server.run_connection_with(server_side, TransportTls::AlreadyDone).await
+            });
+
+            let outcome = tokio::time::timeout(TEST_DEADLINE, serving).await;
+            let result = outcome
+                .expect("the server never gave up")
+                .expect("serving task panicked");
+            result.expect_err("a silent client must surface as an error");
+            let elapsed = start.elapsed();
+            assert!(
+                elapsed >= TIMEOUT && elapsed < TIMEOUT + Duration::from_secs(1),
+                "expected the drop at {TIMEOUT:?}, it took {elapsed:?}"
+            );
+        })
+        .await;
+}

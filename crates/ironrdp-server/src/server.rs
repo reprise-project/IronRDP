@@ -944,6 +944,9 @@ pub struct RdpServerOptions {
     /// The message limit of a dynamic channel whose processor sets none.
     /// Set with `with_max_dynamic_channel_message_size` on [`RdpServer::builder`].
     pub max_dynamic_channel_message_size: Option<usize>,
+    /// How long negotiation and authentication may take, or `None` for 60 s.
+    /// Set with `with_negotiation_timeout` on [`RdpServer::builder`].
+    pub negotiation_timeout: Option<Duration>,
 }
 
 impl RdpServerOptions {
@@ -2042,6 +2045,7 @@ struct PendingConnection {
     security: RdpServerSecurity,
     acceptor: Acceptor,
     credentials_handler: ServerCredentialsHandler,
+    negotiation_timeout: Duration,
 }
 
 #[derive(Default)]
@@ -2120,6 +2124,7 @@ impl PendingConnection {
             security,
             acceptor,
             credentials_handler,
+            negotiation_timeout: NEGOTIATION_TIMEOUT,
         }
     }
 
@@ -2136,7 +2141,7 @@ impl PendingConnection {
     /// caller should abandon the connection quietly rather than treat it as a
     /// connection error (preserving the pre-existing `return Ok(())` behaviour).
     ///
-    /// Bounded by [`NEGOTIATION_TIMEOUT`].
+    /// Bounded by the server's negotiation timeout, [`NEGOTIATION_TIMEOUT`] by default.
     async fn negotiate_and_authenticate<S>(
         self,
         stream: S,
@@ -2145,16 +2150,12 @@ impl PendingConnection {
     where
         S: AsyncRead + AsyncWrite + Send + Sync + Unpin,
     {
-        match tokio::time::timeout(
-            NEGOTIATION_TIMEOUT,
-            self.negotiate_and_authenticate_unbounded(stream, tls),
-        )
-        .await
-        {
+        let timeout = self.negotiation_timeout;
+        match tokio::time::timeout(timeout, self.negotiate_and_authenticate_unbounded(stream, tls)).await {
             Ok(result) => result,
             Err(_) => {
                 warn!(
-                    timeout = ?NEGOTIATION_TIMEOUT,
+                    ?timeout,
                     "Negotiation and authentication did not finish in time, dropping the connection"
                 );
                 Err(ServerError::io(
@@ -2177,6 +2178,7 @@ impl PendingConnection {
             security,
             mut acceptor,
             mut credentials_handler,
+            negotiation_timeout: _,
         } = self;
         let security = &security;
         let framed = TokioFramed::new(stream);
@@ -3133,6 +3135,9 @@ where
             ..ServerCredentialsHandler::default()
         },
     );
+    if let Some(timeout) = ctx.opts.negotiation_timeout {
+        pending.negotiation_timeout = timeout;
+    }
     pending.acceptor.set_credssp_backend(ctx.credssp_backend);
 
     // NOTE: deliberately NO channel attachment here. Building the cliprdr /
@@ -4198,6 +4203,9 @@ impl RdpServer {
                 ..ServerCredentialsHandler::default()
             },
         );
+        if let Some(timeout) = self.opts.negotiation_timeout {
+            pending.negotiation_timeout = timeout;
+        }
         pending.acceptor.set_credssp_backend(self.credssp_backend);
         pending
     }
@@ -7797,6 +7805,7 @@ mod preempt_tests {
                 udp_bind_addr: None,
                 max_static_channel_message_size: None,
                 max_dynamic_channel_message_size: None,
+                negotiation_timeout: None,
             },
             creds: None,
             credssp_backend: CredsspBackend::default(),
