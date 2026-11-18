@@ -41,9 +41,16 @@ impl DisplayControlServer {
 
 impl_as_any!(DisplayControlServer);
 
+/// The largest message reassembled from a client: a layout of 1024 monitors is about 40 KiB.
+const MAX_MESSAGE_SIZE: usize = 64 * 1024;
+
 impl DvcProcessor for DisplayControlServer {
     fn channel_name(&self) -> &str {
         CHANNEL_NAME
+    }
+
+    fn max_message_size(&self) -> Option<usize> {
+        Some(MAX_MESSAGE_SIZE)
     }
 
     fn start(&mut self, _channel_id: u32) -> PduResult<Vec<DvcMessage>> {
