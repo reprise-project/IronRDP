@@ -936,22 +936,17 @@ async fn a_display_that_cannot_start_tells_the_client_why() {
     assert!(matches!(close, Some(Ok(0))), "{close:?}");
 }
 
-/// A client that did not set `RNS_UD_CS_SUPPORT_ERRINFO_PDU`, as FreeRDP 3 does not, gets no reason when the display
-/// cannot start, but still a provider-initiated Disconnect Provider Ultimatum, so it does not take the end of the
-/// session for a lost connection and reconnect.
-// oracle: spec MS-RDPBCGR §3.1.5.1.1
-// oracle: spec MS-RDPBCGR §3.3.5.7.1
+/// A client that did not set `RNS_UD_CS_SUPPORT_ERRINFO_PDU`, as FreeRDP 3 does not, still gets the reason when the
+/// display cannot start, then the Disconnect Provider Ultimatum.
+// oracle: mutant gating the Set Error Info PDU on RNS_UD_CS_SUPPORT_ERRINFO_PDU
 // oracle: regression #2388
 #[tokio::test]
-async fn a_display_that_cannot_start_tells_a_client_without_error_info_that_the_server_ended_the_session() {
+async fn a_display_that_cannot_start_tells_a_client_without_error_info_why() {
     let error_info = ErrorInfo::ProtocolIndependentCode(ProtocolIndependentCode::ServerInsufficientPrivileges);
 
     let (reasons, _) = Box::pin(run_session_end_probe(SessionEnd::DisplayFails(Some(error_info)), false)).await;
 
-    assert!(
-        matches!(reasons.as_slice(), [session::GracefulDisconnectReason::ServerInitiated]),
-        "{reasons:?}"
-    );
+    assert_reason_then_ultimatum(&reasons, error_info);
 }
 
 /// Other display errors close the connection with nothing sent.
@@ -963,19 +958,14 @@ async fn a_display_error_without_error_info_sends_no_reason() {
     assert!(reasons.is_empty(), "{reasons:?}");
 }
 
-/// A client that did not set `RNS_UD_CS_SUPPORT_ERRINFO_PDU`, as FreeRDP 3 does not, gets no reason when the server
-/// disconnects it, but still a provider-initiated Disconnect Provider Ultimatum, so it can tell the server ended the
-/// session from a lost connection.
-// oracle: spec MS-RDPBCGR §3.1.5.1.1
-// oracle: spec MS-RDPBCGR §3.3.5.7.1
+/// A client that did not set `RNS_UD_CS_SUPPORT_ERRINFO_PDU`, as FreeRDP 3 does not, still gets the reason when the
+/// server disconnects it, then the Disconnect Provider Ultimatum.
+// oracle: mutant gating the Set Error Info PDU on RNS_UD_CS_SUPPORT_ERRINFO_PDU
 // oracle: regression #2384
 #[tokio::test]
-async fn a_disconnect_tells_a_client_without_error_info_that_the_server_ended_the_session() {
+async fn a_disconnect_tells_a_client_without_error_info_why() {
     let (reasons, _) = Box::pin(run_session_end_probe(SessionEnd::Disconnect(DISCONNECT_REASON), false)).await;
-    assert!(
-        matches!(reasons.as_slice(), [session::GracefulDisconnectReason::ServerInitiated]),
-        "{reasons:?}"
-    );
+    assert_reason_then_ultimatum(&reasons, DISCONNECT_REASON);
 }
 
 /// A client that set `RNS_UD_CS_SUPPORT_ERRINFO_PDU` gets the reason in a Set Error Info PDU, then the Disconnect
@@ -999,17 +989,29 @@ async fn a_disconnect_tells_an_error_info_client_the_reason_before_the_ultimatum
 const DISCONNECT_REASON: ErrorInfo =
     ErrorInfo::ProtocolIndependentCode(ProtocolIndependentCode::RpcInitiatedDisconnectByuser);
 
-/// A client that another client takes the session from, and that did not set `RNS_UD_CS_SUPPORT_ERRINFO_PDU`, gets no
-/// reason, but still a provider-initiated Disconnect Provider Ultimatum, so it does not reconnect and take the session
-/// back.
-// oracle: spec MS-RDPBCGR §3.1.5.1.1
-// oracle: spec MS-RDPBCGR §3.3.5.7.1
+/// A client that another client takes the session from, and that did not set `RNS_UD_CS_SUPPORT_ERRINFO_PDU`, still gets
+/// the reason, then the Disconnect Provider Ultimatum.
+// oracle: mutant gating the Set Error Info PDU on RNS_UD_CS_SUPPORT_ERRINFO_PDU
 #[tokio::test]
-async fn a_takeover_tells_a_client_without_error_info_that_the_server_ended_the_session() {
+async fn a_takeover_tells_a_client_without_error_info_why() {
     let (reasons, _) = Box::pin(run_session_end_probe(SessionEnd::Takeover, false)).await;
+    assert_reason_then_ultimatum(
+        &reasons,
+        ErrorInfo::ProtocolIndependentCode(ProtocolIndependentCode::DisconnectedByOtherconnection),
+    );
+}
+
+/// Asserts that the client got `expected` in a Set Error Info PDU and then the Disconnect Provider Ultimatum.
+fn assert_reason_then_ultimatum(reasons: &[session::GracefulDisconnectReason], expected: ErrorInfo) {
     assert!(
-        matches!(reasons.as_slice(), [session::GracefulDisconnectReason::ServerInitiated]),
-        "{reasons:?}"
+        matches!(
+            reasons,
+            [
+                session::GracefulDisconnectReason::Other(description),
+                session::GracefulDisconnectReason::ServerInitiated,
+            ] if *description == expected.description()
+        ),
+        "the client did not get {expected:?} and then the ultimatum, it got {reasons:?}"
     );
 }
 

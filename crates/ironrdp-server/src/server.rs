@@ -1573,13 +1573,10 @@ impl ErrorInfoDisconnectHandle {
     /// The disconnect takes effect only after the server handles this event.
     /// Unlike [`ServerEvent::Quit`], the client is told why: it decodes the
     /// PDU and can surface `error` to the user before the connection drops.
+    /// Every client is sent the PDU, including one that left
+    /// `RNS_UD_CS_SUPPORT_ERRINFO_PDU` off, as FreeRDP 3 does by default.
     ///
-    /// The one exception is a client that did not set
-    /// `RNS_UD_CS_SUPPORT_ERRINFO_PDU` in its Client Core Data: MS-RDPBCGR
-    /// 3.3.5.7.1 forbids sending it the PDU, so it is disconnected without
-    /// the reason.
-    ///
-    /// Either way the connection ends with a provider-initiated MCS
+    /// The connection then ends with a provider-initiated MCS
     /// Disconnect Provider Ultimatum, which tells the client that the server
     /// ended the session and the network did not fail.
     #[expect(
@@ -1685,13 +1682,9 @@ pub enum ServerEvent {
     /// client that replaced it, and the two ping-pong indefinitely. Telling
     /// the loser WHY it was disconnected is what makes it stay away.
     ///
-    /// The PDU is only sent to a client that set
-    /// `RNS_UD_CS_SUPPORT_ERRINFO_PDU` in its Client Core Data (MS-RDPBCGR
-    /// 3.3.5.7.1 forbids it otherwise).
-    /// Either way the connection ends with a provider-initiated MCS Disconnect
-    /// Provider Ultimatum, so a client without the reason still learns that the
-    /// server ended the session; FreeRDP 3, which leaves the flag unset by
-    /// default, then stays away too.
+    /// The PDU goes to every client, whatever its
+    /// `RNS_UD_CS_SUPPORT_ERRINFO_PDU` flag says, and is followed by a
+    /// provider-initiated MCS Disconnect Provider Ultimatum.
     /// The anti-storm cooldown on [`RdpServer::run`] covers a client that
     /// reconnects anyway.
     ///
@@ -2315,10 +2308,6 @@ struct ConnectionState {
     /// Whether the client advertised `SUPPORT_HEART_BEAT_PDU` in its GCC
     /// Client Core Data.
     client_supports_heartbeat: bool,
-    /// Whether the client advertised `SUPPORT_ERR_INFO_PDU` in its GCC Client
-    /// Core Data. MS-RDPBCGR 3.3.5.7.1 forbids sending it a Server Set Error
-    /// Info PDU unless it did.
-    client_supports_errinfo: bool,
     /// Auto-detect state, present when the server has auto-detect enabled.
     ///
     /// Probes in flight, RTT samples and the session-lifetime lowest RTT all
@@ -3801,7 +3790,6 @@ impl RdpServer {
             max_graphics_size: None,
             static_channels: StaticChannelSet::new(),
             client_supports_heartbeat: false,
-            client_supports_errinfo: false,
             autodetect: self.autodetect_enabled.then(AutoDetectManager::new),
             autodetect_handles,
             display_suppressed: Arc::new(AtomicBool::new(false)),
@@ -4997,11 +4985,8 @@ impl RdpServer {
             .map_err(|e| ServerError::io("write_all", e))
     }
 
-    /// `conn.client_supports_errinfo` is the client's `RNS_UD_CS_SUPPORT_ERRINFO_PDU`
-    /// early-capability opt-in: MS-RDPBCGR 3.3.5.7.1 forbids sending a Server
-    /// Set Error Info PDU to a client that did not set it, so the two arms below
-    /// that carry a disconnect reason drop the PDU (and just disconnect) when it
-    /// is `false`.
+    /// The two arms below that carry a disconnect reason send it to every
+    /// client, then the Disconnect Provider Ultimatum.
     #[expect(
         clippy::too_many_arguments,
         reason = "private per-connection dispatch; the parameters are the connection's negotiated identifiers and transports"
@@ -5249,7 +5234,6 @@ impl RdpServer {
                     // half-dead the write fails, which is fine — it is leaving
                     // either way, and the caller falls back to cancelling it.
                     send_reason_and_ultimatum(
-                        conn,
                         writer,
                         io_channel_id,
                         user_channel_id,
@@ -5262,8 +5246,7 @@ impl RdpServer {
                 }
                 ServerEvent::Disconnect(error) => {
                     debug!(?error, "Got disconnect event");
-                    send_reason_and_ultimatum(conn, writer, io_channel_id, user_channel_id, error, "disconnect reason")
-                        .await;
+                    send_reason_and_ultimatum(writer, io_channel_id, user_channel_id, error, "disconnect reason").await;
                     *events = pending.collect();
                     return Ok(RunState::Disconnect);
                 }
@@ -6085,7 +6068,6 @@ impl RdpServer {
             Err(error) => {
                 if let ServerErrorKind::ErrorInfo(error_info) = *error.kind() {
                     send_reason_and_ultimatum(
-                        conn,
                         &mut writer,
                         io_channel_id,
                         user_channel_id,
@@ -6468,9 +6450,6 @@ impl RdpServer {
         conn.client_supports_heartbeat = result
             .client_early_capability_flags
             .contains(ironrdp_pdu::gcc::ClientEarlyCapabilityFlags::SUPPORT_HEART_BEAT_PDU);
-        conn.client_supports_errinfo = result
-            .client_early_capability_flags
-            .contains(ironrdp_pdu::gcc::ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU);
         // A client can join the rdpsnd channel although it asked for no audio redirection, as some do for device
         // redirection, so the channel is left joined but never started: no Server Audio Formats PDU goes out, and the
         // sound handler is never asked to start.
@@ -7186,26 +7165,18 @@ fn encode_share_data_pdu(
 }
 
 /// Tells the client why the session ends: sends `error_info` in a Set Error Info PDU ([MS-RDPBCGR 2.2.5.1.1]),
-/// best-effort. A client that did not set RNS_UD_CS_SUPPORT_ERRINFO_PDU is not sent the PDU ([MS-RDPBCGR 3.3.5.7.1]).
+/// best-effort.
+/// Every client is sent it, including one that left RNS_UD_CS_SUPPORT_ERRINFO_PDU off, as FreeRDP 3 does by default.
 /// `reason` names the reason in the logs.
 ///
 /// [MS-RDPBCGR 2.2.5.1.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/a21a1bd9-2303-49c1-90ec-3932435c248c
-/// [MS-RDPBCGR 3.3.5.7.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/e895ef8f-829a-4166-ad29-7d64d200c136
 async fn send_error_info(
-    conn: &ConnectionState,
     writer: &mut impl FramedWrite,
     io_channel_id: u16,
     user_channel_id: u16,
     error_info: ErrorInfo,
     reason: &str,
 ) {
-    if !conn.client_supports_errinfo {
-        debug!(
-            reason,
-            "Client did not opt into Set Error Info PDUs; disconnecting without the reason"
-        );
-        return;
-    }
     let pdu = rdp::headers::ShareDataPdu::ServerSetErrorInfo(ServerSetErrorInfoPdu(error_info));
     // pduSource=0 -- MS-RDPBCGR 2.2.5.1.1 requires it for TS_SET_ERROR_INFO_PDU.
     match encode_share_data_pdu(pdu, 0, io_channel_id, user_channel_id) {
@@ -7221,26 +7192,25 @@ async fn send_error_info(
 }
 
 /// Ends a server-initiated disconnection as [MS-RDPBCGR 1.3.1.4.3] describes, best-effort: `error_info` in a Set
-/// Error Info PDU for a client that opted into it (see [`send_error_info`]), then the MCS Disconnect Provider Ultimatum.
+/// Error Info PDU (see [`send_error_info`]), then the MCS Disconnect Provider Ultimatum.
 /// `reason` names the reason in the logs.
 ///
 /// [MS-RDPBCGR 1.3.1.4.3]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/43ad66ef-67ac-4034-ad70-8fda54eb5115
 async fn send_reason_and_ultimatum(
-    conn: &ConnectionState,
     writer: &mut impl FramedWrite,
     io_channel_id: u16,
     user_channel_id: u16,
     error_info: ErrorInfo,
     reason: &str,
 ) {
-    send_error_info(conn, writer, io_channel_id, user_channel_id, error_info, reason).await;
+    send_error_info(writer, io_channel_id, user_channel_id, error_info, reason).await;
     send_disconnect_ultimatum(writer).await;
 }
 
 /// Sends an MCS Disconnect Provider Ultimatum with reason rn-provider-initiated, as [MS-RDPBCGR 3.1.5.1.1] Sending of
 /// MCS Disconnect Provider Ultimatum PDU requires for an administrator-initiated disconnection, best-effort.
 ///
-/// It tells a client that gets no Set Error Info PDU that the server ended the session on purpose.
+/// It tells a client that ignores the Set Error Info PDU that the server ended the session on purpose.
 /// FreeRDP takes a connection that closes without it for a network failure and reconnects.
 ///
 /// [MS-RDPBCGR 3.1.5.1.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/3efcb3f7-8fa5-488b-8388-bf4d32004b8c
@@ -8559,10 +8529,7 @@ mod cliprdr_error_tests {
         // Left in its initial state, so `require_ready` refuses the request
         // below -- the cheapest reproduction of "the channel said no".
         let cliprdr: CliprdrServer = Cliprdr::new(Box::new(SilentBackend));
-        let mut conn = ConnectionState {
-            client_supports_errinfo: true,
-            ..ConnectionState::default()
-        };
+        let mut conn = ConnectionState::default();
         conn.static_channels.insert(cliprdr);
         conn.static_channels
             .attach_channel_id(TypeId::of::<CliprdrServer>(), 1004);
@@ -8739,30 +8706,6 @@ mod tests {
     use ironrdp_svc::{SvcMessage, SvcServerProcessor};
 
     use super::*;
-
-    /// A client that did not set RNS_UD_CS_SUPPORT_ERRINFO_PDU is not sent a
-    /// Set Error Info PDU; a client that set it is.
-    // oracle: spec MS-RDPBCGR §3.3.5.7.1
-    #[tokio::test]
-    async fn the_error_reason_goes_only_to_a_client_that_supports_it() {
-        let error_info = ErrorInfo::ProtocolIndependentCode(ProtocolIndependentCode::ServerInsufficientPrivileges);
-        let mut conn = ConnectionState::default();
-
-        let mut writer = cliprdr_error_tests::CapturingWriter::default();
-        send_error_info(&conn, &mut writer, 1003, 1007, error_info, "test").await;
-        assert!(writer.0.is_empty(), "sent to a client that does not support it");
-
-        conn.client_supports_errinfo = true;
-        send_error_info(&conn, &mut writer, 1003, 1007, error_info, "test").await;
-        let expected = encode_share_data_pdu(
-            rdp::headers::ShareDataPdu::ServerSetErrorInfo(ServerSetErrorInfoPdu(error_info)),
-            0,
-            1003,
-            1007,
-        )
-        .expect("encode");
-        assert_eq!(writer.0, expected);
-    }
 
     /// A channel backend that owns a resource, released on drop the way
     /// `RdpsndServer` stops its handler.
